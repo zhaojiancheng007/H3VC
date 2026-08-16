@@ -1,10 +1,13 @@
-from .config import EntropyModelConfig
-from .fsq import FSQSpec
-from .model import CosmosFSQEntropyModel, EntropyModelOutput
+from .config_categorical import CategoricalEntropyModelConfig
+from .model_categorical import (
+    CategoricalEntropyModel,
+    CategoricalEntropyOutput,
+    SoftCategoricalEntropyOutput,
+)
 
 __all__ = [
-    "CosmosFSQEntropyModel",
-    "EntropyModelConfig",
-    "EntropyModelOutput",
-    "FSQSpec",
+    "CategoricalEntropyModel",
+    "CategoricalEntropyModelConfig",
+    "CategoricalEntropyOutput",
+    "SoftCategoricalEntropyOutput",
 ]

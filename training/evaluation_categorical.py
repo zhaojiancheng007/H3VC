@@ -10,6 +10,7 @@ import torch.nn.functional as F
 
 from datasets.video_sequence import load_png_sequence
 from entropy_model.model_categorical import CategoricalEntropyModel
+from tokenizer.stage_backbones import TOKENIZER_SPECS
 from metrics.lpips import sequence_lpips
 from tokenizer.cosmos_dv.preprocessing import pad_for_cosmos, unpad_reconstruction
 from tokenizer.stage1_vq import Stage1VQTokenizer
@@ -271,7 +272,7 @@ def evaluate_uvg_v2(
         difference = reference - reconstruction
         squared_error = float(difference.square().sum().item())
         value_count = difference.numel()
-        rate_frames = prepared.model_frames
+        rate_frames = prepared.rate_frames
         rate_pixels = rate_frames * reference.shape[-2] * reference.shape[-1]
         reports.append({
             "sequence": sequence_name,
@@ -305,7 +306,7 @@ def evaluate_uvg_v2(
         "tokenizer": tokenizer_name,
         "protocol": {
             "sequences": list(UVG_SEQUENCES),
-            "model_input_frames": source_frames,
+            "model_input_frames": TOKENIZER_SPECS[tokenizer_name].input_frames,
             "metric_frames": uvg_metric_frames(tokenizer_name),
             "bpp_denominator_frames": source_frames,
             "rate": rate_description,

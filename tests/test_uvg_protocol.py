@@ -4,17 +4,19 @@ from tokenizer.stage_backbones import checkpoint_input_frames_match
 from training.uvg_protocol import prepare_uvg_input, uvg_metric_frames
 
 
-def test_h3_uvg_pads_96_frames_to_aligned_spatial_input() -> None:
+def test_h3_uvg_pads_96_frames_to_107_and_aligned_spatial_input() -> None:
     video = torch.arange(96, dtype=torch.float32).view(96, 1, 1, 1).expand(-1, 3, 33, 49)
 
     prepared = prepare_uvg_input(video, "minimax_h3")
 
     assert uvg_metric_frames("minimax_h3") == 96
     assert prepared.reference.shape == (96, 3, 33, 49)
-    assert prepared.model_input.shape == (1, 3, 96, 48, 64)
+    assert prepared.model_input.shape == (1, 3, 107, 48, 64)
+    assert prepared.model_frames == 107
+    assert prepared.rate_frames == 96
     torch.testing.assert_close(prepared.reference, video)
     torch.testing.assert_close(
-        prepared.model_input[:, :, :, :33, :49],
+        prepared.model_input[:, :, :96, :33, :49],
         video.permute(1, 0, 2, 3).unsqueeze(0).mul(2.0).sub(1.0),
     )
     torch.testing.assert_close(
@@ -24,6 +26,10 @@ def test_h3_uvg_pads_96_frames_to_aligned_spatial_input() -> None:
     torch.testing.assert_close(
         prepared.model_input[:, :, :, :, 49:],
         prepared.model_input[:, :, :, :, 48:49].expand(-1, -1, -1, -1, 15),
+    )
+    torch.testing.assert_close(
+        prepared.model_input[:, :, 96:],
+        prepared.model_input[:, :, 95:96].expand(-1, -1, 11, -1, -1),
     )
 
 
@@ -37,8 +43,8 @@ def test_non_h3_uvg_keeps_97_forward_and_96_metrics() -> None:
     assert prepared.model_input.shape[2] == 97
 
 
-def test_only_old_h3_90_frame_checkpoints_migrate_to_96() -> None:
+def test_h3_90_and_96_frame_checkpoints_remain_loadable_with_107_training() -> None:
+    assert checkpoint_input_frames_match("minimax_h3", 107)
     assert checkpoint_input_frames_match("minimax_h3", 96)
     assert checkpoint_input_frames_match("minimax_h3", 90)
-    assert not checkpoint_input_frames_match("minimax_h3", 107)
     assert not checkpoint_input_frames_match("wanvae", 107)

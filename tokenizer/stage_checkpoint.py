@@ -87,6 +87,7 @@ def load_stage1_tokenizer(
         wan_checkpoint=wan_checkpoint,
         cosmos_repo=cosmos_repo,
         cosmos_cv488_encoder=cosmos_encoder,
+        minimax_h3_training_frames=int(payload["input_frames"]),
         cosmos_cv488_decoder=cosmos_decoder,
         cosmos_cv888_encoder=cosmos_cv888_encoder,
         cosmos_cv888_decoder=cosmos_cv888_decoder,
@@ -105,7 +106,7 @@ def load_stage1_tokenizer(
         name=name,
         step=int(payload["step"]),
         checkpoint=checkpoint,
-        input_frames=spec.input_frames,
+        input_frames=int(payload["input_frames"]),
         latent_channels=spec.latent_channels,
         codebook_dim=spec.codebook_dim,
     )

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import asdict
 from pathlib import Path
 import sys
 
@@ -14,9 +13,9 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from entropy_model.model_categorical import CategoricalEntropyModel
 from metrics.reporting import write_json
-from scripts.stage2_entropytraining import load_checkpoint
+from scripts.stage2 import load_checkpoint
 from tokenizer.stage_checkpoint import load_stage1_tokenizer
-from training.config_stage2 import load_stage2_config
+from training.config_stage2 import load_stage2_config, stage2_config_dict
 from training.evaluation_categorical import evaluate_uvg_v2
 from training.video_losses import create_lpips_vgg
 
@@ -61,7 +60,7 @@ def main() -> None:
     torch.cuda.set_device(device)
     config = load_stage2_config(args.config)
     checkpoint = load_checkpoint(args.checkpoint)
-    if checkpoint["config"] != asdict(config):
+    if checkpoint["config"] != stage2_config_dict(config):
         raise ValueError("Stage2 checkpoint and evaluation config differ")
 
     loaded = load_stage1_tokenizer(

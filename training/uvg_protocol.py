@@ -17,6 +17,7 @@ class EvaluationInput:
     reference: torch.Tensor
     model_input: torch.Tensor
     model_frames: int
+    rate_frames: int
     cosmos_pad: PadInfo | None
 
 
@@ -47,6 +48,10 @@ def prepare_uvg_input(video: torch.Tensor, tokenizer: str) -> EvaluationInput:
             (0, width - video.shape[-1], 0, height - video.shape[-2]),
             mode="replicate",
         )
+        tail = video[-1:].expand(
+            spec.input_frames - video.shape[0], -1, -1, -1
+        )
+        video = torch.cat((video, tail), dim=0)
     model_input = video.permute(1, 0, 2, 3).unsqueeze(0).mul(2.0).sub(1.0)
     cosmos_pad = None
     if tokenizer in {"cosmos_cv488", "cosmos_cv888"}:
@@ -59,7 +64,9 @@ def prepare_uvg_input(video: torch.Tensor, tokenizer: str) -> EvaluationInput:
             f"{tokenizer} must forward {spec.input_frames} frames, "
             f"got {model_input.shape[2]}"
         )
-    return EvaluationInput(reference, model_input, spec.input_frames, cosmos_pad)
+    return EvaluationInput(
+        reference, model_input, spec.input_frames, expected_frames, cosmos_pad
+    )
 
 
 def finish_uvg_reconstruction(

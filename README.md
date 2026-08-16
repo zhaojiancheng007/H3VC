@@ -25,9 +25,9 @@ The training surface contains exactly three scripts:
 
 | Stage | Script | Trainable modules |
 | --- | --- | --- |
-| 1 | `scripts/stage1_tokenizertraining.py` | Cosmos CV4×8×8 or WanVAE, projections, EMA-VQ |
-| 2 | `scripts/stage2_entropytraining.py` | categorical entropy model |
-| 3 | `scripts/stage3_jointtraining.py` | tokenizer, entropy model, optional GAN |
+| 1 | `scripts/stage1.py` | tokenizer backbone, projections, EMA-VQ |
+| 2 | `scripts/stage2.py` | categorical entropy model |
+| 3 | `scripts/stage3.py` | tokenizer, entropy model, optional GAN |
 
 The active scripts do not import one another. Shared model, data, loss,
 checkpoint, and evaluation code lives under `tokenizer/`, `entropy_model/`, and
@@ -35,15 +35,15 @@ checkpoint, and evaluation code lives under `tokenizer/`, `entropy_model/`, and
 
 ## Shared representation
 
-Both supported tokenizer backbones produce a 16-channel latent grid:
+The checked-in configs target MiniMax-H3 and its 24-channel latent grid:
 
 ```text
-video [B,3,25,H,W]
-→ Cosmos CV4×8×8 or WanVAE encoder
-→ pre_quant 16→16
-→ one 4096×16 EMA-VQ codebook
+video [B,3,107,H,W]
+→ MiniMax-H3 encoder
+→ pre_quant 24→24
+→ one 4096×24 EMA-VQ codebook
 → one index per latent position [B,T′,H′,W′]
-→ post_quant 16→16
+→ post_quant 24→24
 → matching decoder
 ```
 
@@ -61,19 +61,15 @@ loss = 1.0 × MSE + 1.0 × LPIPS-VGG + 0.25 × commitment
 ```
 
 ```bash
-torchrun --standalone --nproc_per_node=4 scripts/stage1_tokenizertraining.py \
-  --tokenizer cosmos_cv488 \
-  --config configs/stage1_tokenizer_cosmos_cv488_b4.yaml \
-  --dataset-root /luojix/data/OpenVidHD/openvid_mp4 \
-  --metadata /luojix/data/OpenVidHD/openvid_mp4/full_multilength_scenes/metadata.jsonl \
-  --output-dir outputs/stage1_cosmos_cv488_vq
+torchrun --standalone --nproc_per_node=4 scripts/stage1.py \
+  --tokenizer minimax_h3 \
+  -c configs/stage1.yaml \
+  --output-dir outputs/stage1_h3
 ```
-
-Use `--tokenizer wanvae` and `configs/stage1_tokenizer.yaml` for WanVAE.
 
 ## Stage 2
 
-Stage2 freezes the complete Stage1 tokenizer. The selected 16-dimensional code
+Stage2 freezes the complete Stage1 tokenizer. The selected 24-dimensional code
 vectors are the context and the target is one complete 4096-way index:
 
 ```text
@@ -87,12 +83,10 @@ loss = total negative log₂ probability / number of indices
 ```
 
 ```bash
-torchrun --standalone --nproc_per_node=4 scripts/stage2_entropytraining.py \
-  --config configs/stage2_entropy.yaml \
-  --dataset-root /luojix/data/OpenVidHD/openvid_mp4 \
-  --metadata /luojix/data/OpenVidHD/openvid_mp4/full_multilength_scenes/metadata.jsonl \
-  --tokenizer-checkpoint outputs/stage1_cosmos_cv488_vq/checkpoints/step_0020000.pt \
-  --output-dir outputs/stage2_cosmos_cv488_entropy
+torchrun --standalone --nproc_per_node=4 scripts/stage2.py \
+  -c configs/stage2.yaml \
+  --tokenizer-checkpoint outputs/stage1_h3/checkpoints/checkpoint_best.pt \
+  --output-dir outputs/stage2_h3
 ```
 
 The tokenizer type is read from the Stage1 checkpoint, so the same command also
@@ -113,28 +107,25 @@ loss = 1.0 × MSE
      + gan_weight × GAN loss
 ```
 
-The canonical config linearly increases `λ` from 0.8 to 4.8 over steps 0–2000,
-then holds `λ=4.8` through step 20000; both phases use `τ=0.01`. From steps
-20000–22000, `λ` linearly increases from 4.8 to 12 with `τ=0.1`, then remains
-at 12 through step 30000. `gan_weight=0`, so GAN training is disabled. There is
-no gradient accumulation.
+The canonical config fixes `λ=7.2` and `τ=0.01` for 60000 steps. Tokenizer and
+entropy-model learning rates change at steps 15000, 30000, and 45000.
+`gan_weight=0`, so GAN training is disabled. There is no gradient accumulation.
 
 ```bash
-torchrun --standalone --nproc_per_node=4 scripts/stage3_jointtraining.py \
-  --config configs/stage3_joint_vq.yaml \
-  --dataset-root /luojix/data/OpenVidHD/openvid_mp4 \
-  --metadata /luojix/data/OpenVidHD/openvid_mp4/full_multilength_scenes/metadata.jsonl \
-  --tokenizer-checkpoint outputs/stage1_cosmos_cv488_vq/checkpoints/step_0020000.pt \
-  --entropy-checkpoint outputs/stage2_cosmos_cv488_entropy/checkpoints/step_0060000.pt \
-  --output-dir outputs/stage3_cosmos_cv488_joint
+torchrun --standalone --nproc_per_node=4 scripts/stage3.py \
+  -c configs/stage3.yaml \
+  --tokenizer-checkpoint outputs/stage1_h3/checkpoints/checkpoint_best.pt \
+  --entropy-checkpoint outputs/stage2_h3/checkpoints/checkpoint_best.pt \
+  --output-dir outputs/stage3_h3
 ```
 
 ## Outputs
 
-Every 5000 steps, each stage saves `checkpoints/step_N.pt`. Stage1, Stage2, and
-Stage3 run the same seven-sequence, 96-frame UVG protocol and write structured
-JSON under `evaluations/`. Benchmark output contains at least `psnr`, `bpp`, and
-`latency_ms`; LPIPS and DISTS are also reported.
+Every 5000 steps, all three stages run the same seven-sequence, 96-frame UVG
+protocol and write structured JSON under `evaluations/`. Stage1 retains the
+lowest-LPIPS checkpoint, Stage2 retains the lowest-BPP checkpoint, and Stage3
+retains every 5000-step checkpoint. Benchmark output contains at least `psnr`,
+`bpp`, and `latency_ms`; LPIPS and DISTS are also reported.
 
 Training metrics are written to `train_metrics.jsonl`, compact logs to
 `training.log`, and the exact run configuration to `run_manifest.json`.

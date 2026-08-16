@@ -24,17 +24,14 @@ TOKENIZER_SPECS = {
     "wanvae": TokenizerSpec("wanvae", 97, 16, 16),
     "cosmos_cv488": TokenizerSpec("cosmos_cv488", 97, 16, 16),
     "cosmos_cv888": TokenizerSpec("cosmos_cv888", 97, 16, 16),
-    "minimax_h3": TokenizerSpec("minimax_h3", 96, 24, 24),
+    "minimax_h3": TokenizerSpec("minimax_h3", 107, 24, 24),
 }
 
 
 def checkpoint_input_frames_match(tokenizer: str, checkpoint_frames: int) -> bool:
-    current_frames = TOKENIZER_SPECS[tokenizer].input_frames
-    return checkpoint_frames == current_frames or (
-        tokenizer == "minimax_h3"
-        and checkpoint_frames == 90
-        and current_frames == 96
-    )
+    if tokenizer == "minimax_h3":
+        return checkpoint_frames in {90, 96, 107}
+    return checkpoint_frames == TOKENIZER_SPECS[tokenizer].input_frames
 
 
 def _training_checkpoint(owner, function, *args):
@@ -46,8 +43,9 @@ def _training_checkpoint(owner, function, *args):
 class MiniMaxH3Backbone(nn.Module):
     MODEL_FRAMES = 107
 
-    def __init__(self, model_dir: str | Path) -> None:
+    def __init__(self, model_dir: str | Path, *, training_frames: int = 107) -> None:
         super().__init__()
+        self.training_frames = training_frames
         model_dir = Path(model_dir).resolve()
         if not (model_dir / "minimax_h3_video_vae.py").is_file():
             raise FileNotFoundError(model_dir / "minimax_h3_video_vae.py")
@@ -69,23 +67,27 @@ class MiniMaxH3Backbone(nn.Module):
         )
 
     def encode(self, video: torch.Tensor) -> torch.Tensor:
-        source_frames = TOKENIZER_SPECS["minimax_h3"].input_frames
-        if video.shape[2] != source_frames:
+        input_frames = int(video.shape[2])
+        if self.training and input_frames != self.training_frames:
             raise ValueError(
-                f"MiniMax-H3 requires {source_frames} source frames, got {video.shape[2]}"
+                f"MiniMax-H3 training requires {self.training_frames} source frames, "
+                f"got {input_frames}"
             )
-        tail = video[:, :, -1:].expand(
-            -1, -1, self.MODEL_FRAMES - source_frames, -1, -1
-        )
-        model_input = torch.cat((video, tail), dim=2)
-        pixels = model_input.float().add(1.0).div(2.0)
+        if input_frames not in {90, 96, self.MODEL_FRAMES}:
+            raise ValueError(f"MiniMax-H3 cannot align {input_frames} input frames")
+        if input_frames < self.MODEL_FRAMES:
+            tail = video[:, :, -1:].expand(
+                -1, -1, self.MODEL_FRAMES - input_frames, -1, -1
+            )
+            video = torch.cat((video, tail), dim=2)
+        pixels = video.float().add(1.0).div(2.0)
         normalized = self.model.processor.transform_tensor(pixels)
         moments = self.model.encode_temporal(normalized)
         posterior_mean, _ = moments.chunk(2, dim=1)
         return posterior_mean
 
     def decode(self, latent: torch.Tensor) -> torch.Tensor:
-        source_frames = TOKENIZER_SPECS["minimax_h3"].input_frames
+        output_frames = self.training_frames if self.training else self.MODEL_FRAMES
         decoded = self.model.decode_base(
             latent.float(), frame_num=self.MODEL_FRAMES, process_image=False
         )
@@ -94,7 +96,7 @@ class MiniMaxH3Backbone(nn.Module):
                 f"MiniMax-H3 decoded {decoded.shape[2]} frames, expected {self.MODEL_FRAMES}"
             )
         pixels = self.model.processor.revert_tensor(decoded)
-        return pixels[:, :, :source_frames].mul(2.0).sub(1.0)
+        return pixels[:, :, :output_frames].mul(2.0).sub(1.0)
 
 
 def build_backbone(
@@ -108,6 +110,7 @@ def build_backbone(
     cosmos_cv888_encoder: str | Path,
     cosmos_cv888_decoder: str | Path,
     minimax_h3_model_dir: str | Path,
+    minimax_h3_training_frames: int | None = None,
 ) -> nn.Module:
     if tokenizer == "wanvae":
         return WanVAEBackbone(wan_repo, wan_checkpoint)
@@ -120,5 +123,9 @@ def build_backbone(
             cosmos_repo, cosmos_cv888_encoder, cosmos_cv888_decoder
         )
     if tokenizer == "minimax_h3":
-        return MiniMaxH3Backbone(minimax_h3_model_dir)
+        training_frames = (
+            TOKENIZER_SPECS[tokenizer].input_frames
+            if minimax_h3_training_frames is None else minimax_h3_training_frames
+        )
+        return MiniMaxH3Backbone(minimax_h3_model_dir, training_frames=training_frames)
     raise ValueError(f"Unknown tokenizer {tokenizer!r}")
