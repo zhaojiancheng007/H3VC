@@ -1,0 +1,32 @@
+# Python caches and local environments
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Machine-local configuration
+.env
+.env.*
+!.env.example
+
+# Datasets, checkpoints, and experiment outputs
+/data/
+/outputs/
+/pretrained_ckpts/
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.jit
+*.onnx
+*.log
+
+# Generated plots and patch leftovers
+/plots/
+*.orig
+*.rej
+*~
+.DS_Store

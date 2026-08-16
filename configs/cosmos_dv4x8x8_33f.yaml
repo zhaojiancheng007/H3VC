@@ -1,0 +1,12 @@
+model_id: Cosmos-0.1-Tokenizer-DV4x8x8
+num_frames: 33
+temporal_compression: 4
+spatial_compression: 8
+fsq_levels: [8, 8, 8, 5, 5, 5]
+train_preprocess:
+  resize_short_side: 512
+  crop_size: 256
+eval_preprocess:
+  preserve_resolution: true
+  spatial_alignment: 16
+  temporal_alignment: 8

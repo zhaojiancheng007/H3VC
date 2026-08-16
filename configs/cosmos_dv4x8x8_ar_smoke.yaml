@@ -1,0 +1,23 @@
+model:
+  levels: [8, 8, 8, 5, 5, 5]
+  window_size: 8
+  d_model: 64
+  num_layers: 2
+  num_heads: 4
+  ffn_dim: 128
+  max_latent_frames: 9
+optimizer:
+  learning_rate: 0.00005
+  betas: [0.9, 0.97]
+  weight_decay: 0.05
+  grad_clip_norm: 1.0
+  warmup_steps: 0
+train:
+  batch_size: 1
+  gradient_accumulation: 1
+  max_steps: 1
+  num_workers: 0
+  seed: 2026
+  log_interval: 1
+  checkpoint_interval: 1
+  bf16: true

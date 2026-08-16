@@ -1,0 +1,27 @@
+model:
+  levels: [8, 8, 8, 5, 5, 5]
+  window_size: 8
+  d_model: 384
+  num_layers: 8
+  num_heads: 6
+  ffn_dim: 1024
+  max_latent_frames: 9
+optimizer:
+  tokenizer_learning_rate: 0.000001
+  ar_learning_rate: 0.00001
+  betas: [0.9, 0.95]
+  grad_clip_norm: 1.0
+loss:
+  mse_weight: 1.0
+  lpips_weight: 1.0
+  rate_weight: 0.8
+  surrogate_temperature: 0.1
+  lpips_net: vgg
+train:
+  batch_size: 4
+  gradient_accumulation: 1
+  max_steps: 20000
+  num_workers: 4
+  seed: 2026
+  log_interval: 20
+  checkpoint_interval: 5000

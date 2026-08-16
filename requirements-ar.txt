@@ -1,0 +1,7 @@
+-r requirements.txt
+compressai==1.2.8
+DISTS-pytorch==0.1
+lpips==0.1.4
+opencv-python-headless==4.10.0.84
+scenedetect==0.6.7.1
+tqdm==4.69.1
