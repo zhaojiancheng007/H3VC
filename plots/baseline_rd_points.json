@@ -1,0 +1,345 @@
+{
+  "schema_version": 1,
+  "source": {
+    "paper": "Generative Neural Video Compression via Video Diffusion Prior",
+    "figure": 4,
+    "pdf_page": 6,
+    "pdf_path": "papers/GNVC-VD.pdf",
+    "data_origin": "digitized_from_vector_paths_not_author_raw_data"
+  },
+  "protocol": {
+    "datasets": [
+      "HEVC-B",
+      "UVG",
+      "MCL-JCV"
+    ],
+    "frames_per_sequence": 96,
+    "color_space": "RGB_BT.709",
+    "metrics": [
+      {
+        "name": "LPIPS-VGG",
+        "direction": "lower_is_better"
+      },
+      {
+        "name": "DISTS",
+        "direction": "lower_is_better"
+      }
+    ]
+  },
+  "curves": [
+    {
+      "dataset": "HEVC-B",
+      "metric": "LPIPS-VGG",
+      "method": "GLC-Video",
+      "points": [
+        {
+          "bpp": 0.00747225,
+          "value": 0.34669976
+        },
+        {
+          "bpp": 0.01049244,
+          "value": 0.32805836
+        },
+        {
+          "bpp": 0.01445889,
+          "value": 0.31663036
+        },
+        {
+          "bpp": 0.01875783,
+          "value": 0.31085558
+        }
+      ]
+    },
+    {
+      "dataset": "HEVC-B",
+      "metric": "LPIPS-VGG",
+      "method": "GNVC-VD",
+      "points": [
+        {
+          "bpp": 0.00412115,
+          "value": 0.33468416
+        },
+        {
+          "bpp": 0.00618808,
+          "value": 0.29970113
+        },
+        {
+          "bpp": 0.00990886,
+          "value": 0.26772706
+        },
+        {
+          "bpp": 0.01777125,
+          "value": 0.22661466
+        },
+        {
+          "bpp": 0.02753085,
+          "value": 0.2031508
+        }
+      ]
+    },
+    {
+      "dataset": "HEVC-B",
+      "metric": "DISTS",
+      "method": "GLC-Video",
+      "points": [
+        {
+          "bpp": 0.00747225,
+          "value": 0.10038574
+        },
+        {
+          "bpp": 0.01049244,
+          "value": 0.09153021
+        },
+        {
+          "bpp": 0.01445889,
+          "value": 0.08566454
+        },
+        {
+          "bpp": 0.01875783,
+          "value": 0.08233246
+        }
+      ]
+    },
+    {
+      "dataset": "HEVC-B",
+      "metric": "DISTS",
+      "method": "GNVC-VD",
+      "points": [
+        {
+          "bpp": 0.00412115,
+          "value": 0.11017786
+        },
+        {
+          "bpp": 0.00618808,
+          "value": 0.09113396
+        },
+        {
+          "bpp": 0.00990886,
+          "value": 0.07532608
+        },
+        {
+          "bpp": 0.01777125,
+          "value": 0.05690657
+        },
+        {
+          "bpp": 0.02753085,
+          "value": 0.04776886
+        }
+      ]
+    },
+    {
+      "dataset": "UVG",
+      "metric": "LPIPS-VGG",
+      "method": "GLC-Video",
+      "points": [
+        {
+          "bpp": 0.00576725,
+          "value": 0.31497898
+        },
+        {
+          "bpp": 0.00840226,
+          "value": 0.30096753
+        },
+        {
+          "bpp": 0.01200059,
+          "value": 0.29244719
+        },
+        {
+          "bpp": 0.01592597,
+          "value": 0.28805025
+        }
+      ]
+    },
+    {
+      "dataset": "UVG",
+      "metric": "LPIPS-VGG",
+      "method": "GNVC-VD",
+      "points": [
+        {
+          "bpp": 0.0038003,
+          "value": 0.29109974
+        },
+        {
+          "bpp": 0.00539525,
+          "value": 0.26603516
+        },
+        {
+          "bpp": 0.00880061,
+          "value": 0.23599615
+        },
+        {
+          "bpp": 0.01602517,
+          "value": 0.20049643
+        },
+        {
+          "bpp": 0.02516942,
+          "value": 0.18203738
+        }
+      ]
+    },
+    {
+      "dataset": "UVG",
+      "metric": "DISTS",
+      "method": "GLC-Video",
+      "points": [
+        {
+          "bpp": 0.00576725,
+          "value": 0.09262289
+        },
+        {
+          "bpp": 0.00840226,
+          "value": 0.08645704
+        },
+        {
+          "bpp": 0.01200059,
+          "value": 0.0828848
+        },
+        {
+          "bpp": 0.01592597,
+          "value": 0.08051932
+        }
+      ]
+    },
+    {
+      "dataset": "UVG",
+      "metric": "DISTS",
+      "method": "GNVC-VD",
+      "points": [
+        {
+          "bpp": 0.0038003,
+          "value": 0.1144045
+        },
+        {
+          "bpp": 0.00539525,
+          "value": 0.09695159
+        },
+        {
+          "bpp": 0.00880061,
+          "value": 0.08236848
+        },
+        {
+          "bpp": 0.01602517,
+          "value": 0.06140938
+        },
+        {
+          "bpp": 0.02516942,
+          "value": 0.05324428
+        }
+      ]
+    },
+    {
+      "dataset": "MCL-JCV",
+      "metric": "LPIPS-VGG",
+      "method": "GLC-Video",
+      "points": [
+        {
+          "bpp": 0.00756526,
+          "value": 0.32209108
+        },
+        {
+          "bpp": 0.01028551,
+          "value": 0.30187934
+        },
+        {
+          "bpp": 0.01381874,
+          "value": 0.2881313
+        },
+        {
+          "bpp": 0.01765578,
+          "value": 0.28009726
+        }
+      ]
+    },
+    {
+      "dataset": "MCL-JCV",
+      "metric": "LPIPS-VGG",
+      "method": "GNVC-VD",
+      "points": [
+        {
+          "bpp": 0.0036763,
+          "value": 0.31795755
+        },
+        {
+          "bpp": 0.00529605,
+          "value": 0.28999544
+        },
+        {
+          "bpp": 0.00857431,
+          "value": 0.26173953
+        },
+        {
+          "bpp": 0.01557955,
+          "value": 0.2256522
+        },
+        {
+          "bpp": 0.02444091,
+          "value": 0.20394104
+        }
+      ]
+    },
+    {
+      "dataset": "MCL-JCV",
+      "metric": "DISTS",
+      "method": "GLC-Video",
+      "points": [
+        {
+          "bpp": 0.00756526,
+          "value": 0.1022469
+        },
+        {
+          "bpp": 0.01028551,
+          "value": 0.0923167
+        },
+        {
+          "bpp": 0.01381874,
+          "value": 0.08615084
+        },
+        {
+          "bpp": 0.01765578,
+          "value": 0.08258462
+        }
+      ]
+    },
+    {
+      "dataset": "MCL-JCV",
+      "metric": "DISTS",
+      "method": "GNVC-VD",
+      "points": [
+        {
+          "bpp": 0.0036763,
+          "value": 0.13658837
+        },
+        {
+          "bpp": 0.00529605,
+          "value": 0.11305966
+        },
+        {
+          "bpp": 0.00857431,
+          "value": 0.09448405
+        },
+        {
+          "bpp": 0.01557955,
+          "value": 0.07139962
+        },
+        {
+          "bpp": 0.02444091,
+          "value": 0.06106717
+        }
+      ]
+    }
+  ],
+  "validation": {
+    "curve_count": 12,
+    "point_count": 54,
+    "points_per_curve": {
+      "GLC-Video": 4,
+      "GNVC-VD": 5
+    },
+    "max_vector_marker_center_delta_pt": 0.002579593160272898,
+    "max_marker_to_matching_pixel_distance_px": 0.6409753088969229,
+    "max_nearest_rgb_error": 0.0,
+    "all_curve_vertices_match_markers": true,
+    "all_points_match_rendered_method_color": true
+  },
+  "precision_notice": "Values are recovered from plotted vector coordinates. Extra decimal places do not imply access to the authors' raw experimental data."
+}

@@ -25,7 +25,7 @@ venv/
 *.log
 
 # Generated plots and patch leftovers
-/plots/
+/plots/output/
 *.orig
 *.rej
 *~

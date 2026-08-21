@@ -12,13 +12,16 @@ from datasets.video_sequence import load_png_sequence
 from entropy_model.model_categorical import CategoricalEntropyModel
 from tokenizer.stage_backbones import TOKENIZER_SPECS
 from metrics.lpips import sequence_lpips
-from tokenizer.cosmos_dv.preprocessing import pad_for_cosmos, unpad_reconstruction
 from tokenizer.stage1_vq import Stage1VQTokenizer
 from tokenizer.stage3_vq import selected_code_vectors
+from training.uvg_protocol import (
+    finish_uvg_reconstruction,
+    prepare_uvg_input,
+    uvg_metric_frames,
+    uvg_source_frames,
+)
 
 
-UVG_FRAMES = 96
-UVG_SEGMENTS = (25, 25, 25, 21)
 UVG_SEQUENCES = (
     "Beauty",
     "Bosphorus",
@@ -28,6 +31,19 @@ UVG_SEQUENCES = (
     "ShakeNDry",
     "YachtRide",
 )
+MCL_JCV_SEQUENCES = tuple(f"videoSRC{index:02d}" for index in range(1, 31))
+HEVC_B_SEQUENCES = (
+    "BasketballDrive_1920x1080_50",
+    "BQTerrace_1920x1080_60",
+    "Cactus_1920x1080_50",
+    "Kimono1_1920x1080_24",
+    "ParkScene_1920x1080_24",
+)
+DATASET_NAMES = {
+    "uvg": "UVG",
+    "mcl_jcv": "MCL-JCV",
+    "hevc_b": "HEVC-B",
+}
 
 
 def _sequence_dists(
@@ -73,157 +89,17 @@ def _estimated_bits(
 
 
 @torch.inference_mode()
-def evaluate_uvg(
-    tokenizer: Stage1VQTokenizer,
-    entropy_model: CategoricalEntropyModel,
-    tokenizer_name: str,
-    uvg_root: str | Path,
-    lpips_metric: torch.nn.Module,
-    dists_metric: DISTS,
-    device: torch.device,
-) -> dict:
-    tokenizer.eval()
-    entropy_model.eval()
-    reports = []
-    for sequence_name in UVG_SEQUENCES:
-        frames_dir = (
-            Path(uvg_root)
-            / f"{sequence_name}_1920x1080_120fps_420_8bit_YUV_frames"
-        )
-        video, _ = load_png_sequence(frames_dir, UVG_FRAMES, start_frame=1)
-        frame_offset = 0
-        squared_error = 0.0
-        value_count = 0
-        estimated_bits = 0.0
-        lpips_sum = 0.0
-        dists_sum = 0.0
-        total_ms = 0.0
-
-        for frame_count in UVG_SEGMENTS:
-            reference = video[frame_offset : frame_offset + frame_count].float().div(255.0)
-            model_input = (
-                reference.permute(1, 0, 2, 3).unsqueeze(0).mul(2.0).sub(1.0)
-            )
-            pad_info = None
-            if tokenizer_name in {"cosmos_cv488", "cosmos_cv888"}:
-                temporal_alignment = 4 if tokenizer_name == "cosmos_cv488" else 8
-                model_input, pad_info = pad_for_cosmos(
-                    model_input,
-                    temporal_alignment=temporal_alignment,
-                    spatial_alignment=16,
-                )
-            model_input = model_input.to(device)
-
-            torch.cuda.synchronize(device)
-            started = time.perf_counter()
-            with torch.autocast("cuda", dtype=torch.bfloat16):
-                latent = tokenizer.encode(model_input)
-                projected = tokenizer.pre_quant(latent)
-            flat = (
-                projected.permute(0, 2, 3, 4, 1)
-                .reshape(-1, projected.shape[1])
-                .float()
-            )
-            flat_indices = tokenizer.quantizer._nearest_indices(flat)
-            indices = flat_indices.reshape(
-                projected.shape[0],
-                projected.shape[2],
-                projected.shape[3],
-                projected.shape[4],
-            )
-            selected = selected_code_vectors(tokenizer.quantizer.embed, indices)
-            with torch.autocast("cuda", dtype=torch.bfloat16):
-                current_bits = _estimated_bits(entropy_model, selected, indices)
-            with torch.autocast("cuda", dtype=torch.bfloat16):
-                reconstruction = tokenizer.decode(
-                    tokenizer.post_quant(selected.to(projected.dtype))
-                )
-            torch.cuda.synchronize(device)
-            total_ms += (time.perf_counter() - started) * 1000.0
-
-            if pad_info is not None:
-                reconstruction = unpad_reconstruction(reconstruction, pad_info)
-            reconstruction = (
-                reconstruction.float().clamp(-1.0, 1.0).add(1.0).div(2.0)
-                .squeeze(0).permute(1, 0, 2, 3).cpu()
-            )
-            difference = reference - reconstruction
-            squared_error += float(difference.square().sum().item())
-            value_count += difference.numel()
-            estimated_bits += float(current_bits.item())
-            lpips_sum += sequence_lpips(
-                reference,
-                reconstruction,
-                lpips_metric,
-                device=device,
-                batch_size=1,
-            ) * frame_count
-            dists_sum += _sequence_dists(
-                reference, reconstruction, dists_metric, device
-            ) * frame_count
-            frame_offset += frame_count
-
-        pixels = frame_offset * video.shape[-2] * video.shape[-1]
-        reports.append(
-            {
-                "sequence": sequence_name,
-                "frames": frame_offset,
-                "psnr": -10.0 * math.log10(squared_error / value_count),
-                "bpp": estimated_bits / pixels,
-                "lpips": lpips_sum / frame_offset,
-                "dists": dists_sum / frame_offset,
-                "latency_ms": total_ms / frame_offset,
-                "estimated_bits": estimated_bits,
-                "squared_error": squared_error,
-                "value_count": value_count,
-            }
-        )
-
-    total_frames = sum(report["frames"] for report in reports)
-    total_pixels = total_frames * 1080 * 1920
-    total_error = sum(report["squared_error"] for report in reports)
-    total_values = sum(report["value_count"] for report in reports)
-    return {
-        "schema_version": 1,
-        "dataset": "UVG",
-        "tokenizer": tokenizer_name,
-        "protocol": {
-            "sequences": list(UVG_SEQUENCES),
-            "frames_per_sequence": UVG_FRAMES,
-            "segments": list(UVG_SEGMENTS),
-            "rate": "estimated 4096-way categorical cross-entropy bits",
-        },
-        "aggregate": {
-            "psnr": -10.0 * math.log10(total_error / total_values),
-            "bpp": sum(report["estimated_bits"] for report in reports) / total_pixels,
-            "lpips": sum(report["lpips"] * report["frames"] for report in reports)
-            / total_frames,
-            "dists": sum(report["dists"] * report["frames"] for report in reports)
-            / total_frames,
-            "latency_ms": sum(
-                report["latency_ms"] * report["frames"] for report in reports
-            ) / total_frames,
-        },
-        "sequences": reports,
-    }
-
-@torch.inference_mode()
-def evaluate_uvg_v2(
+def evaluate_benchmark(
     tokenizer: Stage1VQTokenizer,
     entropy_model: CategoricalEntropyModel | None,
     tokenizer_name: str,
-    uvg_root: str | Path,
-    lpips_metric: torch.nn.Module,
+    dataset: str,
+    dataset_root: str | Path,
+    lpips_vgg_metric: torch.nn.Module,
+    lpips_alex_metric: torch.nn.Module,
     dists_metric: DISTS,
     device: torch.device,
 ) -> dict:
-    from training.uvg_protocol import (
-        finish_uvg_reconstruction,
-        prepare_uvg_input,
-        uvg_metric_frames,
-        uvg_source_frames,
-    )
-
     tokenizer.eval()
     if entropy_model is None:
         bits_per_index = math.log2(tokenizer.quantizer.embed.shape[0])
@@ -235,11 +111,19 @@ def evaluate_uvg_v2(
         rate_description = "estimated categorical cross-entropy bits"
     source_frames = uvg_source_frames(tokenizer_name)
     reports = []
-    for sequence_name in UVG_SEQUENCES:
-        frames_dir = (
-            Path(uvg_root)
-            / f"{sequence_name}_1920x1080_120fps_420_8bit_YUV_frames"
+    root = Path(dataset_root)
+    if dataset == "uvg":
+        sequences = tuple(
+            (name, root / f"{name}_1920x1080_120fps_420_8bit_YUV_frames")
+            for name in UVG_SEQUENCES
         )
+    else:
+        names = {
+            "mcl_jcv": MCL_JCV_SEQUENCES,
+            "hevc_b": HEVC_B_SEQUENCES,
+        }[dataset]
+        sequences = tuple((name, root / name) for name in names)
+    for sequence_name, frames_dir in sequences:
         video, _ = load_png_sequence(frames_dir, source_frames, start_frame=1)
         prepared = prepare_uvg_input(video.float().div(255.0), tokenizer_name)
         torch.cuda.synchronize(device)
@@ -274,6 +158,13 @@ def evaluate_uvg_v2(
         value_count = difference.numel()
         rate_frames = prepared.rate_frames
         rate_pixels = rate_frames * reference.shape[-2] * reference.shape[-1]
+        lpips_vgg = sequence_lpips(
+            reference, reconstruction, lpips_vgg_metric, device=device, batch_size=1
+        )
+        lpips_alex = sequence_lpips(
+            reference, reconstruction, lpips_alex_metric, device=device, batch_size=1
+        )
+        dists = _sequence_dists(reference, reconstruction, dists_metric, device)
         reports.append({
             "sequence": sequence_name,
             "frames": reference.shape[0],
@@ -281,10 +172,10 @@ def evaluate_uvg_v2(
             "resolution": [reference.shape[-2], reference.shape[-1]],
             "psnr": -10.0 * math.log10(squared_error / value_count),
             "bpp": bits / rate_pixels,
-            "lpips": sequence_lpips(
-                reference, reconstruction, lpips_metric, device=device, batch_size=1
-            ),
-            "dists": _sequence_dists(reference, reconstruction, dists_metric, device),
+            "lpips": lpips_vgg,
+            "lpips_vgg": lpips_vgg,
+            "lpips_alex": lpips_alex,
+            "dists": dists,
             "latency_ms": total_ms / reference.shape[0],
             "bits": bits,
             "squared_error": squared_error,
@@ -302,10 +193,10 @@ def evaluate_uvg_v2(
     total_values = sum(report["value_count"] for report in reports)
     return {
         "schema_version": 2,
-        "dataset": "UVG",
+        "dataset": DATASET_NAMES[dataset],
         "tokenizer": tokenizer_name,
         "protocol": {
-            "sequences": list(UVG_SEQUENCES),
+            "sequences": [name for name, _ in sequences],
             "model_input_frames": TOKENIZER_SPECS[tokenizer_name].input_frames,
             "metric_frames": uvg_metric_frames(tokenizer_name),
             "bpp_denominator_frames": source_frames,
@@ -317,6 +208,12 @@ def evaluate_uvg_v2(
             / total_rate_pixels,
             "lpips": sum(report["lpips"] * report["frames"] for report in reports)
             / total_frames,
+            "lpips_vgg": sum(
+                report["lpips_vgg"] * report["frames"] for report in reports
+            ) / total_frames,
+            "lpips_alex": sum(
+                report["lpips_alex"] * report["frames"] for report in reports
+            ) / total_frames,
             "dists": sum(report["dists"] * report["frames"] for report in reports)
             / total_frames,
             "latency_ms": sum(

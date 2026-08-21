@@ -16,10 +16,11 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from datasets.video_sequence import load_png_sequence
 from entropy_model.model_categorical import CategoricalEntropyModel
-from metrics.lpips import sequence_lpips
+from metrics.lpips import create_standard_lpips, sequence_lpips
 from metrics.reporting import write_json
 from scripts.stage2 import load_checkpoint
 from tokenizer.stage3_vq import selected_code_vectors
+from tokenizer.stage_backbones import TOKENIZER_SPECS
 from tokenizer.stage_checkpoint import load_stage1_tokenizer
 from training.config_stage2 import load_stage2_config
 from training.evaluation_categorical import _estimated_bits, _sequence_dists
@@ -42,7 +43,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--config", required=True)
     parser.add_argument("--output", required=True)
-    parser.add_argument("--mcl-jcv-root", required=True)
+    parser.add_argument(
+        "--mcl-jcv-root",
+        default="/luojix/data/MCL-JCV/figure4_bt709_first96",
+    )
     parser.add_argument("--wan-repo", default=str(PROJECT_ROOT / "Wan2.1"))
     parser.add_argument(
         "--wan-checkpoint",
@@ -90,7 +94,8 @@ def evaluate_mcl_jcv(
     entropy_model: CategoricalEntropyModel,
     tokenizer_name: str,
     dataset_root: Path,
-    lpips_metric: torch.nn.Module,
+    lpips_vgg_metric: torch.nn.Module,
+    lpips_alex_metric: torch.nn.Module,
     dists_metric: DISTS,
     device: torch.device,
 ) -> dict:
@@ -148,7 +153,14 @@ def evaluate_mcl_jcv(
                 "lpips": sequence_lpips(
                     reference,
                     reconstruction,
-                    lpips_metric,
+                    lpips_vgg_metric,
+                    device=device,
+                    batch_size=1,
+                ),
+                "lpips_alex": sequence_lpips(
+                    reference,
+                    reconstruction,
+                    lpips_alex_metric,
                     device=device,
                     batch_size=1,
                 ),
@@ -177,7 +189,7 @@ def evaluate_mcl_jcv(
         "tokenizer": tokenizer_name,
         "protocol": {
             "sequences": list(MCL_JCV_SEQUENCES),
-            "model_input_frames": source_frames,
+            "model_input_frames": TOKENIZER_SPECS[tokenizer_name].input_frames,
             "metric_frames": uvg_metric_frames(tokenizer_name),
             "bpp_denominator_frames": source_frames,
             "rate": "estimated categorical cross-entropy bits",
@@ -187,6 +199,10 @@ def evaluate_mcl_jcv(
             "bpp": sum(report["bits"] for report in reports) / total_rate_pixels,
             "lpips": sum(
                 report["lpips"] * report["frames"] for report in reports
+            )
+            / total_frames,
+            "lpips_alex": sum(
+                report["lpips_alex"] * report["frames"] for report in reports
             )
             / total_frames,
             "dists": sum(
@@ -226,6 +242,7 @@ def main() -> None:
     entropy_model = CategoricalEntropyModel(config.model).to(device).eval()
     entropy_model.load_state_dict(checkpoint["model"], strict=True)
     lpips_metric = create_lpips_vgg(device)
+    lpips_alex_metric = create_standard_lpips(device)
     dists_metric = DISTS().to(device).eval()
 
     evaluation = evaluate_mcl_jcv(
@@ -234,6 +251,7 @@ def main() -> None:
         loaded.name,
         Path(args.mcl_jcv_root),
         lpips_metric,
+        lpips_alex_metric,
         dists_metric,
         device,
     )

@@ -52,6 +52,13 @@ from training.distributed_runtime import (
     restore_rng_state,
 )
 
+from training.periodic_benchmarks import (
+    BENCHMARKS_BY_RANK,
+    benchmark_for_rank,
+    evaluation_command,
+    evaluation_environment,
+)
+
 
 CHECKPOINT_VERSION = 2
 
@@ -73,6 +80,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tokenizer-checkpoint", required=True)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--uvg-root", default="/luojix/data/UVG")
+    parser.add_argument(
+        "--mcl-jcv-root",
+        default="/luojix/data/MCL-JCV/figure4_bt709_first96",
+    )
+    parser.add_argument(
+        "--hevc-b-root",
+        default="/luojix/data/HEVC-B/figure4_bt709_first96",
+    )
     parser.add_argument("--wan-repo", default=str(PROJECT_ROOT / "Wan2.1"))
     parser.add_argument(
         "--wan-checkpoint",
@@ -180,7 +195,7 @@ def keep_best_bpp_checkpoint(
 def evaluate_checkpoint_in_subprocess(
     args: argparse.Namespace,
     checkpoint_path: Path,
-    evaluation_path: Path,
+    evaluation_dir: Path,
     tokenizer: torch.nn.Module,
     model: CategoricalEntropyModel,
     optimizer: torch.optim.Optimizer,
@@ -193,58 +208,22 @@ def evaluate_checkpoint_in_subprocess(
     torch.cuda.empty_cache()
     dist.barrier()
 
-    if rank == 0:
+    benchmark = benchmark_for_rank(args, rank, evaluation_dir)
+    if benchmark is not None:
+        dataset, dataset_root, output_path = benchmark
         tokenizer.to("cpu")
         model.to("cpu")
         move_optimizer_state(optimizer, torch.device("cpu"))
         gc.collect()
         torch.cuda.empty_cache()
-
-        visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
-        physical_device = (
-            str(local_rank)
-            if visible_devices is None
-            else visible_devices.split(",")[local_rank]
-        )
-        environment = os.environ.copy()
-        environment["CUDA_VISIBLE_DEVICES"] = physical_device
-        environment["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
-        for name in ("RANK", "LOCAL_RANK", "WORLD_SIZE", "MASTER_ADDR", "MASTER_PORT"):
-            environment.pop(name, None)
         subprocess.run(
-            [
-                sys.executable,
-                str(PROJECT_ROOT / "scripts/evaluate_stage2_entropy_uvg.py"),
-                "--checkpoint",
-                str(checkpoint_path.resolve()),
-                "--config",
-                str(Path(args.config).resolve()),
-                "--output",
-                str(evaluation_path.resolve()),
-                "--uvg-root",
-                args.uvg_root,
-                "--wan-repo",
-                args.wan_repo,
-                "--wan-checkpoint",
-                args.wan_checkpoint,
-                "--cosmos-repo",
-                args.cosmos_repo,
-                "--cosmos-encoder",
-                args.cosmos_encoder,
-                "--cosmos-decoder",
-                args.cosmos_decoder,
-                "--cosmos-cv888-encoder",
-                args.cosmos_cv888_encoder,
-                "--cosmos-cv888-decoder",
-                args.cosmos_cv888_decoder,
-                "--minimax-h3-model-dir",
-                args.minimax_h3_model_dir,
-            ],
+            evaluation_command(
+                args, 2, checkpoint_path, dataset, dataset_root, output_path, PROJECT_ROOT
+            ),
             cwd=PROJECT_ROOT,
-            env=environment,
+            env=evaluation_environment(local_rank),
             check=True,
         )
-
         tokenizer.to(device)
         model.to(device)
         move_optimizer_state(optimizer, device)
@@ -314,6 +293,8 @@ def run(args: argparse.Namespace) -> None:
     rank = int(os.environ["RANK"])
     local_rank = int(os.environ["LOCAL_RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
+    if world_size < len(BENCHMARKS_BY_RANK):
+        raise ValueError("Periodic evaluation requires at least 3 distributed ranks")
     torch.cuda.set_device(local_rank)
     device = torch.device("cuda", local_rank)
     config = load_stage2_config(args.config)
@@ -513,7 +494,8 @@ def run(args: argparse.Namespace) -> None:
                 )
 
         if step % config.train.checkpoint_interval == 0:
-            evaluation_path = output_dir / "evaluations" / f"step_{step:07d}.json"
+            evaluation_dir = output_dir / "evaluations" / f"step_{step:07d}"
+            uvg_evaluation_path = evaluation_dir / "uvg.json"
             checkpoint_path = (
                 output_dir / "checkpoints" / f".candidate_step_{step:07d}.pt"
             )
@@ -539,7 +521,7 @@ def run(args: argparse.Namespace) -> None:
             ddp_model = evaluate_checkpoint_in_subprocess(
                 args,
                 checkpoint_path,
-                evaluation_path,
+                evaluation_dir,
                 tokenizer,
                 model,
                 optimizer,
@@ -550,14 +532,14 @@ def run(args: argparse.Namespace) -> None:
             if rank == 0:
                 improved = keep_best_bpp_checkpoint(
                     checkpoint_path,
-                    evaluation_path,
+                    uvg_evaluation_path,
                     output_dir / "checkpoints" / "checkpoint_best.pt",
                     output_dir / "best_checkpoint.json",
                 )
                 append_log(
                     log_path,
                     f"step={step:07d} best_bpp_updated={str(improved).lower()} "
-                    f"evaluation={evaluation_path}",
+                    f"evaluation={evaluation_dir}",
                 )
             dist.barrier()
             tokenizer.eval()

@@ -1,4 +1,5 @@
 import ast
+from argparse import Namespace
 import json
 from pathlib import Path
 
@@ -16,6 +17,7 @@ from tokenizer.stage3_vq import relaxed_quantize
 from training import evaluation_categorical
 from training.config_stage2 import learning_rate_at_step, load_stage2_config
 from training.config_stage3 import learning_rates_at_step, load_stage3_config
+from training.periodic_benchmarks import benchmark_for_rank, evaluation_command
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -83,8 +85,6 @@ def test_canonical_configs_use_4096x24_without_gradient_accumulation() -> None:
     assert stage2.model.codebook_dim == stage3.model.codebook_dim == 24
     assert not hasattr(stage2.train, "gradient_accumulation")
     assert not hasattr(stage3.train, "gradient_accumulation")
-    assert rate_parameters(0, stage3) == (7.2, 0.01)
-    assert rate_parameters(60_000, stage3) == (7.2, 0.01)
     assert stage3.loss.gan_start_step == 20000
     assert stage3.loss.gan_weight == 0.0
 
@@ -117,8 +117,10 @@ def test_h3_stage3_uses_fixed_rate_and_multistep_learning_rates() -> None:
 
     assert config.train.max_steps == 60_000
     assert config.train.checkpoint_interval == 5_000
+    assert config.train.bf16
+    configured_rate = (config.loss.rate_weight, config.loss.temperature)
     for step in (0, 15_000, 30_000, 45_000, 60_000):
-        assert rate_parameters(step, config) == (7.2, 0.01)
+        assert rate_parameters(step, config) == configured_rate
     expected = (
         (0, 1e-5, 5e-5),
         (14_999, 1e-5, 5e-5),
@@ -257,18 +259,75 @@ def test_h3_uvg_rate_uses_one_path_for_raw_and_entropy_bits(monkeypatch) -> None
     monkeypatch.setattr(evaluation_categorical, "_sequence_dists", lambda *_args: 0.0)
     monkeypatch.setattr(evaluation_categorical.torch.cuda, "synchronize", lambda *_args: None)
 
-    report = evaluation_categorical.evaluate_uvg_v2(
-        Tokenizer(), EntropyModel(), "minimax_h3", "/unused", None, None,
+    report = evaluation_categorical.evaluate_benchmark(
+        Tokenizer(), EntropyModel(), "minimax_h3", "uvg", "/unused", None, None, None,
         torch.device("cpu"),
     )
 
-    raw_report = evaluation_categorical.evaluate_uvg_v2(
-        Tokenizer(), None, "minimax_h3", "/unused", None, None,
+    raw_report = evaluation_categorical.evaluate_benchmark(
+        Tokenizer(), None, "minimax_h3", "uvg", "/unused", None, None, None,
         torch.device("cpu"),
+    )
+
+    loaded_paths = []
+    monkeypatch.setattr(
+        evaluation_categorical,
+        "HEVC_B_SEQUENCES",
+        ("Cactus_1920x1080_50",),
+    )
+    monkeypatch.setattr(
+        evaluation_categorical,
+        "load_png_sequence",
+        lambda path, *_args, **_kwargs: (
+            loaded_paths.append(path) or torch.zeros(96, 3, 16, 16),
+            None,
+        ),
+    )
+    hevc_report = evaluation_categorical.evaluate_benchmark(
+        Tokenizer(), None, "minimax_h3", "hevc_b", "/bench/hevc_b",
+        None, None, None, torch.device("cpu"),
     )
 
     for result in (report, raw_report):
         assert result["protocol"]["model_input_frames"] == 107
         assert result["protocol"]["bpp_denominator_frames"] == 96
+        assert result["aggregate"]["lpips_alex"] == 0.0
     assert report["aggregate"]["bpp"] == 1.0 / 256.0
     assert raw_report["aggregate"]["bpp"] == 1.0 / 2048.0
+    assert loaded_paths == [Path("/bench/hevc_b/Cactus_1920x1080_50")]
+    assert hevc_report["dataset"] == "HEVC-B"
+
+
+def test_periodic_benchmarks_map_ranks_to_three_datasets(tmp_path: Path) -> None:
+    args = Namespace(
+        config=str(ROOT / "configs/stage2.yaml"),
+        uvg_root="/shared/uvg",
+        mcl_jcv_root="/shared/mcl_jcv",
+        hevc_b_root="/shared/hevc_b",
+        wan_repo="wan",
+        wan_checkpoint="wan.pt",
+        cosmos_repo="cosmos",
+        cosmos_encoder="cv488_encoder.pt",
+        cosmos_decoder="cv488_decoder.pt",
+        cosmos_cv888_encoder="cv888_encoder.pt",
+        cosmos_cv888_decoder="cv888_decoder.pt",
+        minimax_h3_model_dir="h3",
+    )
+    evaluation_dir = tmp_path / "evaluations" / "step_0005000"
+
+    assignments = [
+        benchmark_for_rank(args, rank, evaluation_dir) for rank in range(4)
+    ]
+
+    assert assignments == [
+        ("uvg", Path("/shared/uvg"), evaluation_dir / "uvg.json"),
+        ("mcl_jcv", Path("/shared/mcl_jcv"), evaluation_dir / "mcl_jcv.json"),
+        ("hevc_b", Path("/shared/hevc_b"), evaluation_dir / "hevc_b.json"),
+        None,
+    ]
+    command = evaluation_command(
+        args, 2, tmp_path / "checkpoint.pt", *assignments[1], ROOT
+    )
+    assert command[1].endswith("scripts/evaluate_stage2_entropy_uvg.py")
+    assert command[command.index("--dataset") + 1] == "mcl_jcv"
+    assert command[command.index("--output") + 1].endswith("mcl_jcv.json")

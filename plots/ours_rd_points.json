@@ -1,0 +1,46 @@
+{
+  "schema_version": 1,
+  "protocol": {
+    "datasets": ["UVG", "MCL-JCV"],
+    "frames_per_sequence": 96,
+    "model_input_frames": 107,
+    "resolution": [1080, 1920],
+    "color_space": "RGB_BT.709",
+    "rate_source": "estimated_categorical_cross_entropy_bits",
+    "latency_ms": "codec mean per frame",
+    "lpips": "LPIPS-VGG 0.1, frame arithmetic mean",
+    "dists": "DISTS-pytorch 0.1, frame arithmetic mean"
+  },
+  "points": [
+    {
+      "dataset": "UVG",
+      "method": "ARCodec (Minimax-H3)",
+      "label": "lambda=24, 25k",
+      "bpp": 0.003316649179609995,
+      "psnr": 27.427047319420158,
+      "latency_ms": 429.68051361995526,
+      "lpips_vgg": 0.2518428925070025,
+      "dists": 0.07435780142744382
+    },
+    {
+      "dataset": "UVG",
+      "method": "ARCodec (Minimax-H3)",
+      "label": "lambda=12, 50k",
+      "bpp": 0.005636804166925017,
+      "psnr": 29.115106949754615,
+      "latency_ms": 429.4587444261803,
+      "lpips_vgg": 0.21722451748237723,
+      "dists": 0.059495379793502036
+    },
+    {
+      "dataset": "MCL-JCV",
+      "method": "ARCodec (Minimax-H3)",
+      "label": "lambda=24, 25k",
+      "bpp": 0.003676900159838432,
+      "psnr": 24.989777482845952,
+      "latency_ms": 428.9440815434015,
+      "lpips_vgg": 0.2673243688910993,
+      "dists": 0.08688932172954082
+    }
+  ]
+}

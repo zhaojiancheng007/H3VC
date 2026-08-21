@@ -11,12 +11,13 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from entropy_model.model_categorical import CategoricalEntropyModel
+from metrics.lpips import create_standard_lpips
 from metrics.reporting import write_json
 from scripts.stage3 import load_stage3_checkpoint
 from tokenizer.stage3_vq import JointVQModel
 from tokenizer.stage_checkpoint import load_stage1_tokenizer
 from training.config_stage3 import load_stage3_config, stage3_config_dict
-from training.evaluation_categorical import evaluate_uvg_v2
+from training.evaluation_categorical import evaluate_benchmark
 from training.video_losses import create_lpips_vgg
 
 
@@ -25,7 +26,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--config", required=True)
     parser.add_argument("--output", required=True)
-    parser.add_argument("--uvg-root", default="/luojix/data/UVG")
+    parser.add_argument("--dataset", required=True, choices=("uvg", "mcl_jcv", "hevc_b"))
+    parser.add_argument("--dataset-root", required=True)
     parser.add_argument("--wan-repo", default=str(PROJECT_ROOT / "Wan2.1"))
     parser.add_argument("--wan-checkpoint", default=str(PROJECT_ROOT / "pretrained_ckpts/Wan2.1/Wan2.1_VAE.pth"))
     parser.add_argument("--cosmos-repo", default=str(PROJECT_ROOT / "Cosmos-Tokenizer"))
@@ -60,12 +62,14 @@ def main() -> None:
     ).to(device)
     model.load_state_dict(checkpoint["model"], strict=True)
     model.eval()
-    evaluation = evaluate_uvg_v2(
+    evaluation = evaluate_benchmark(
         model.tokenizer,
         model.entropy_model,
         loaded.name,
-        args.uvg_root,
+        args.dataset,
+        args.dataset_root,
         create_lpips_vgg(device),
+        create_standard_lpips(device),
         DISTS().to(device).eval(),
         device,
     )

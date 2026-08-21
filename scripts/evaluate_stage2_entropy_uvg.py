@@ -12,22 +12,24 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from entropy_model.model_categorical import CategoricalEntropyModel
+from metrics.lpips import create_standard_lpips
 from metrics.reporting import write_json
 from scripts.stage2 import load_checkpoint
 from tokenizer.stage_checkpoint import load_stage1_tokenizer
 from training.config_stage2 import load_stage2_config, stage2_config_dict
-from training.evaluation_categorical import evaluate_uvg_v2
+from training.evaluation_categorical import evaluate_benchmark
 from training.video_losses import create_lpips_vgg
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Evaluate one unified Stage2 entropy checkpoint on UVG"
+        description="Evaluate one Stage2 entropy checkpoint on a shared benchmark"
     )
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--config", required=True)
     parser.add_argument("--output", required=True)
-    parser.add_argument("--uvg-root", default="/luojix/data/UVG")
+    parser.add_argument("--dataset", required=True, choices=("uvg", "mcl_jcv", "hevc_b"))
+    parser.add_argument("--dataset-root", required=True)
     parser.add_argument("--wan-repo", default=str(PROJECT_ROOT / "Wan2.1"))
     parser.add_argument(
         "--wan-checkpoint",
@@ -78,14 +80,17 @@ def main() -> None:
     entropy_model = CategoricalEntropyModel(config.model).to(device).eval()
     entropy_model.load_state_dict(checkpoint["model"], strict=True)
     lpips_metric = create_lpips_vgg(device)
+    lpips_alex_metric = create_standard_lpips(device)
     dists_metric = DISTS().to(device).eval()
 
-    evaluation = evaluate_uvg_v2(
+    evaluation = evaluate_benchmark(
         tokenizer,
         entropy_model,
         loaded.name,
-        args.uvg_root,
+        args.dataset,
+        args.dataset_root,
         lpips_metric,
+        lpips_alex_metric,
         dists_metric,
         device,
     )

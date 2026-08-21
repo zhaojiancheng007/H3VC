@@ -11,19 +11,21 @@ import torch
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
+from metrics.lpips import create_standard_lpips
 from metrics.reporting import write_json
 from tokenizer.stage_checkpoint import load_stage1_tokenizer
-from training.evaluation_categorical import evaluate_uvg_v2
+from training.evaluation_categorical import evaluate_benchmark
 from training.video_losses import create_lpips_vgg
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Evaluate one unified Stage1 tokenizer checkpoint on UVG"
+        description="Evaluate one Stage1 tokenizer checkpoint on a shared benchmark"
     )
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--output", required=True)
-    parser.add_argument("--uvg-root", default="/luojix/data/UVG")
+    parser.add_argument("--dataset", required=True, choices=("uvg", "mcl_jcv", "hevc_b"))
+    parser.add_argument("--dataset-root", required=True)
     parser.add_argument("--wan-repo", default=str(PROJECT_ROOT / "Wan2.1"))
     parser.add_argument(
         "--wan-checkpoint",
@@ -67,14 +69,17 @@ def main() -> None:
     )
     model = loaded.model.to(device).eval()
     lpips_metric = create_lpips_vgg(device)
+    lpips_alex_metric = create_standard_lpips(device)
     dists_metric = DISTS().to(device).eval()
 
-    evaluation = evaluate_uvg_v2(
+    evaluation = evaluate_benchmark(
         model,
         None,
         loaded.name,
-        Path(args.uvg_root),
+        args.dataset,
+        Path(args.dataset_root),
         lpips_metric,
+        lpips_alex_metric,
         dists_metric,
         device,
     )

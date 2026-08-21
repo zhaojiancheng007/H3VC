@@ -78,6 +78,48 @@ def test_eval_does_not_update_ema_codebook() -> None:
         torch.testing.assert_close(value, before[name], rtol=0, atol=0)
 
 
+def test_stage1_replaces_codes_below_cluster_size_one() -> None:
+    quantizer = EMAVectorQuantizer(
+        codebook_size=4,
+        codebook_dim=2,
+        samples_per_rank=2,
+    )
+    quantizer.initted.fill_(True)
+    quantizer.embed.copy_(
+        torch.tensor(
+            [
+                [0.0, 0.0],
+                [10.0, 10.0],
+                [20.0, 20.0],
+                [30.0, 30.0],
+            ]
+        )
+    )
+    quantizer.cluster_size.copy_(torch.tensor([10.0, 0.5, 0.1, 2.0]))
+    quantizer.embed_sum.copy_(
+        quantizer.embed * quantizer.cluster_size[:, None]
+    )
+
+    projected = torch.zeros(1, 2, 1, 1, 1)
+    quantizer(projected)
+
+    torch.testing.assert_close(
+        quantizer.cluster_size,
+        torch.tensor([9.91, 1.0, 1.0, 1.98]),
+    )
+    assert quantizer.num_updates.item() == 1
+
+
+def test_stage1_loads_checkpoint_without_revival_update_counter() -> None:
+    quantizer = EMAVectorQuantizer(codebook_size=4, codebook_dim=2)
+    old_state = quantizer.state_dict()
+    old_state.pop("num_updates")
+
+    quantizer.load_state_dict(old_state, strict=True)
+
+    assert quantizer.num_updates.item() == 0
+
+
 def test_checkpoint_contains_general_stage1_state(tmp_path) -> None:
     model = Stage1VQTokenizer(TinyBackbone(), codebook_size=4, codebook_dim=16)
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)

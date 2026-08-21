@@ -16,6 +16,10 @@ from tokenizer.wan_vq.parallel_wan import parallel_decode, parallel_encode
 CODEBOOK_SIZE = 4096
 CODEBOOK_DIM = 16
 QUANTIZER_GEOMETRY = "raw_l2"
+DEAD_CODE_THRESHOLD = 1.0
+DEAD_CODE_UPDATE_INTERVAL = 1
+DEAD_CODE_RESET_CLUSTER_SIZE = 1.0
+DEAD_CODE_SAMPLES_PER_RANK = 512
 
 
 @dataclass
@@ -45,17 +49,57 @@ class EMAVectorQuantizer(nn.Module):
         decay: float = 0.99,
         commitment_weight: float = 0.25,
         chunk_size: int = 4096,
+        dead_code_threshold: float = DEAD_CODE_THRESHOLD,
+        dead_code_update_interval: int = DEAD_CODE_UPDATE_INTERVAL,
+        reset_cluster_size: float = DEAD_CODE_RESET_CLUSTER_SIZE,
+        samples_per_rank: int = DEAD_CODE_SAMPLES_PER_RANK,
     ) -> None:
         super().__init__()
+        if dead_code_threshold <= 0.0:
+            raise ValueError("dead_code_threshold must be positive")
+        if dead_code_update_interval <= 0:
+            raise ValueError("dead_code_update_interval must be positive")
+        if reset_cluster_size <= 0.0:
+            raise ValueError("reset_cluster_size must be positive")
+        if samples_per_rank <= 0:
+            raise ValueError("samples_per_rank must be positive")
         self.codebook_size = codebook_size
         self.codebook_dim = codebook_dim
         self.decay = decay
         self.commitment_weight = commitment_weight
         self.chunk_size = chunk_size
+        self.dead_code_threshold = dead_code_threshold
+        self.dead_code_update_interval = dead_code_update_interval
+        self.reset_cluster_size = reset_cluster_size
+        self.samples_per_rank = samples_per_rank
         self.register_buffer("embed", torch.zeros(codebook_size, codebook_dim))
         self.register_buffer("cluster_size", torch.ones(codebook_size))
         self.register_buffer("embed_sum", torch.zeros(codebook_size, codebook_dim))
         self.register_buffer("initted", torch.tensor(False))
+        self.register_buffer("num_updates", torch.zeros((), dtype=torch.long))
+
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ) -> None:
+        update_key = prefix + "num_updates"
+        if update_key not in state_dict:
+            state_dict[update_key] = self.num_updates.detach().clone()
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
 
     @torch.no_grad()
     def _initialize(self, inputs: torch.Tensor) -> None:
@@ -136,6 +180,58 @@ class EMAVectorQuantizer(nn.Module):
         self.embed_sum.mul_(self.decay).add_(sums, alpha=1.0 - self.decay)
         self.embed.copy_(self.embed_sum / self.cluster_size.clamp_min(1e-5)[:, None])
 
+    @torch.no_grad()
+    def _sample_pool(self, inputs: torch.Tensor) -> torch.Tensor:
+        indices = torch.randint(
+            0,
+            inputs.shape[0],
+            (self.samples_per_rank,),
+            device=inputs.device,
+        )
+        local_samples = inputs.index_select(0, indices)
+        if not dist.is_initialized():
+            return local_samples
+        gathered = [
+            torch.empty_like(local_samples) for _ in range(dist.get_world_size())
+        ]
+        dist.all_gather(gathered, local_samples)
+        return torch.cat(gathered, dim=0)
+
+    @torch.no_grad()
+    def _revive_dead_codes_(self, inputs: torch.Tensor) -> None:
+        if int(self.num_updates.item()) % self.dead_code_update_interval != 0:
+            return
+        dead_ids = torch.nonzero(
+            self.cluster_size < self.dead_code_threshold,
+            as_tuple=False,
+        ).squeeze(1)
+        if dead_ids.numel() == 0:
+            return
+
+        pool = self._sample_pool(inputs)
+        dead_count = int(dead_ids.numel())
+        if not dist.is_initialized() or dist.get_rank() == 0:
+            selected = torch.randint(
+                0,
+                pool.shape[0],
+                (dead_count,),
+                device=pool.device,
+            )
+            replacements = pool.index_select(0, selected)
+        else:
+            replacements = torch.empty(
+                dead_count,
+                self.codebook_dim,
+                device=inputs.device,
+                dtype=torch.float32,
+            )
+        if dist.is_initialized():
+            dist.broadcast(replacements, src=0)
+
+        self.embed[dead_ids] = replacements
+        self.cluster_size[dead_ids] = self.reset_cluster_size
+        self.embed_sum[dead_ids] = replacements * self.reset_cluster_size
+
     def forward(
         self, projected: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -159,6 +255,8 @@ class EMAVectorQuantizer(nn.Module):
         quantized = flat + (selected - flat).detach()
         if self.training:
             self._update(flat.detach(), indices)
+            self._revive_dead_codes_(flat.detach())
+            self.num_updates.add_(1)
 
         quantized = quantized.to(dtype).reshape(
             shape[0], shape[2], shape[3], shape[4], self.codebook_dim
