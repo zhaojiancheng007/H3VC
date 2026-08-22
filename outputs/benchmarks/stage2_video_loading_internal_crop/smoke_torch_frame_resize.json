@@ -1,0 +1,57 @@
+{
+  "benchmark": "stage2_video_loading_internal_crop_ab",
+  "bpp": 0.08171341980623323,
+  "cohort_sha256": "05238de72152a41c2d0acb62574d02c2291aa43510c7ce713a3c31b6b0141c0b",
+  "comparison": {
+    "opencv_torch_frame_resize_crop": {
+      "mean_latency_speedup": 1.3668806646197533,
+      "p95_latency_speedup": 1.064661731349018,
+      "throughput_speedup": 1.1118249957091704
+    }
+  },
+  "decode_threads": 2,
+  "latency_ms": {
+    "opencv": 1459.7561041882727,
+    "opencv_torch_frame_resize_crop": 1067.946999304695
+  },
+  "methods": {
+    "opencv": {
+      "latency_max_ms": 3501.3264671433717,
+      "latency_ms": 1459.7561041882727,
+      "latency_p50_ms": 1236.5861861035228,
+      "latency_p95_ms": 3501.3264671433717,
+      "throughput_sequences_per_second": 1.880214567462953,
+      "wall_seconds": 4.254833537852392
+    },
+    "opencv_torch_frame_resize_crop": {
+      "latency_max_ms": 3288.675044896081,
+      "latency_ms": 1067.946999304695,
+      "latency_p50_ms": 756.1459036078304,
+      "latency_p95_ms": 3288.675044896081,
+      "throughput_sequences_per_second": 2.0904695534018174,
+      "wall_seconds": 3.8268914211075753
+    }
+  },
+  "num_frames": 25,
+  "psnr": {
+    "opencv_torch_frame_resize_crop": {
+      "compared_samples": 8,
+      "exact_match_count": 8,
+      "psnr": null,
+      "psnr_min": null,
+      "psnr_per_sample": [
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null
+      ]
+    }
+  },
+  "sample_count": 8,
+  "schema_version": 1,
+  "workers": 4
+}

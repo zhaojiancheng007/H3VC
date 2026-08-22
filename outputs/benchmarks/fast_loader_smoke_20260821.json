@@ -1,0 +1,53 @@
+{
+  "benchmark": "stage2_video_loading_internal_crop_ab",
+  "bpp": 0.08171341980623323,
+  "cohort_sha256": "10fa62328e690756194910811a301da626f5eabadfda6056a3f987722f59f323",
+  "comparison": {
+    "opencv_resize_crop": {
+      "mean_latency_speedup": 5.6914262769190325,
+      "p95_latency_speedup": 6.658821769349259,
+      "throughput_speedup": 6.555856079060812
+    }
+  },
+  "decode_threads": 2,
+  "latency_ms": {
+    "opencv": 1528.0771485995501,
+    "opencv_resize_crop": 268.48755904939026
+  },
+  "methods": {
+    "opencv": {
+      "latency_max_ms": 3848.94554130733,
+      "latency_ms": 1528.0771485995501,
+      "latency_p50_ms": 1241.1600374616683,
+      "latency_p95_ms": 3848.94554130733,
+      "throughput_sequences_per_second": 1.7201892701858998,
+      "wall_seconds": 4.6506510293111205
+    },
+    "opencv_resize_crop": {
+      "latency_max_ms": 578.0220096930861,
+      "latency_ms": 268.48755904939026,
+      "latency_p50_ms": 192.3754015006125,
+      "latency_p95_ms": 578.0220096930861,
+      "throughput_sequences_per_second": 11.277313284083412,
+      "wall_seconds": 0.709388823248446
+    }
+  },
+  "num_frames": 25,
+  "psnr": {
+    "opencv_resize_crop": {
+      "compared_samples": 4,
+      "exact_match_count": 0,
+      "psnr": 60.78203032522372,
+      "psnr_min": 60.18242934707476,
+      "psnr_per_sample": [
+        60.27511062233005,
+        61.60983761065726,
+        61.06074372083282,
+        60.18242934707476
+      ]
+    }
+  },
+  "sample_count": 8,
+  "schema_version": 1,
+  "workers": 4
+}

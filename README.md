@@ -18,20 +18,26 @@ For an existing clone, initialize the dependencies with:
 git submodule update --init --recursive
 ```
 
-Datasets, pretrained weights, checkpoints, logs, and generated plots are local
-artifacts and are not stored in Git.
+Datasets, pretrained weights, checkpoints, logs, reconstructions, and generated
+plots are local artifacts and are not stored in Git. Small structured loader
+benchmarks under `outputs/benchmarks/` are the only versioned output artifacts.
 
-The training surface contains exactly three scripts:
+The current train-eval pipeline has one entry per stage:
 
-| Stage | Script | Trainable modules |
+| Stage | Cosine entry | Integrated behavior |
 | --- | --- | --- |
-| 1 | `scripts/stage1.py` | tokenizer backbone, projections, EMA-VQ |
-| 2 | `scripts/stage2.py` | categorical entropy model |
-| 3 | `scripts/stage3.py` | tokenizer, entropy model, optional GAN |
+| 1 | `scripts/stage1_cosine.py` | cosine LR, high-throughput loader, video-distributed Gaussian eval |
+| 2 | `scripts/stage2_cosine.py` | cosine LR, high-throughput loader, video-distributed Gaussian eval |
+| 3 | `scripts/stage3_cosine.py` | cosine LR, high-throughput loader, video-distributed Gaussian eval, direct `--resume` |
 
-The active scripts do not import one another. Shared model, data, loss,
-checkpoint, and evaluation code lives under `tokenizer/`, `entropy_model/`, and
-`training/`.
+These entries use the canonical `configs/stage*_cosine.yaml` files. GPU count is
+selected at launch through `torchrun --nproc_per_node`; it is not fixed by the
+repository. A checkpoint must resume with the same `world_size` and global
+batch size. The original `scripts/stage1.py`, `scripts/stage2.py`, and
+`scripts/stage3.py` entries remain as baseline references.
+
+The complete checkpoint, distributed eval, resume, metric, and reconstruction
+contract is fixed in [docs/train_eval_workflow.md](docs/train_eval_workflow.md).
 
 ## Shared representation
 
@@ -61,9 +67,9 @@ loss = 1.0 × MSE + 1.0 × LPIPS-VGG + 0.25 × commitment
 ```
 
 ```bash
-torchrun --standalone --nproc_per_node=4 scripts/stage1.py \
+torchrun --standalone --nproc_per_node=<gpu_count> scripts/stage1_cosine.py \
   --tokenizer minimax_h3 \
-  -c configs/stage1.yaml \
+  -c configs/stage1_cosine.yaml \
   --output-dir outputs/stage1_h3
 ```
 
@@ -83,8 +89,8 @@ loss = total negative log₂ probability / number of indices
 ```
 
 ```bash
-torchrun --standalone --nproc_per_node=4 scripts/stage2.py \
-  -c configs/stage2.yaml \
+torchrun --standalone --nproc_per_node=<gpu_count> scripts/stage2_cosine.py \
+  -c configs/stage2_cosine.yaml \
   --tokenizer-checkpoint outputs/stage1_h3/checkpoints/checkpoint_best.pt \
   --output-dir outputs/stage2_h3
 ```
@@ -107,13 +113,12 @@ loss = 1.0 × MSE
      + gan_weight × GAN loss
 ```
 
-The canonical config fixes `λ=7.2` and `τ=0.01` for 60000 steps. Tokenizer and
-entropy-model learning rates change at steps 15000, 30000, and 45000.
-`gan_weight=0`, so GAN training is disabled. There is no gradient accumulation.
+The current λ=18 config uses cosine schedules for tokenizer and entropy-model
+learning rates. `gan_weight=0`, so GAN training is disabled.
 
 ```bash
-torchrun --standalone --nproc_per_node=4 scripts/stage3.py \
-  -c configs/stage3.yaml \
+torchrun --standalone --nproc_per_node=<gpu_count> scripts/stage3_cosine.py \
+  -c configs/stage3_lambda18_cosine.yaml \
   --tokenizer-checkpoint outputs/stage1_h3/checkpoints/checkpoint_best.pt \
   --entropy-checkpoint outputs/stage2_h3/checkpoints/checkpoint_best.pt \
   --output-dir outputs/stage3_h3
@@ -121,11 +126,13 @@ torchrun --standalone --nproc_per_node=4 scripts/stage3.py \
 
 ## Outputs
 
-Every 5000 steps, all three stages run the same seven-sequence, 96-frame UVG
-protocol and write structured JSON under `evaluations/`. Stage1 retains the
-lowest-LPIPS checkpoint, Stage2 retains the lowest-BPP checkpoint, and Stage3
-retains every 5000-step checkpoint. Benchmark output contains at least `psnr`,
-`bpp`, and `latency_ms`; LPIPS and DISTS are also reported.
+Every 5000 steps, all three stages distribute the 42-video UVG, MCL-JCV, and
+HEVC-B benchmark across all training ranks and use Gaussian spatial-tile
+blending. Stage1 retains the lowest-LPIPS checkpoint, Stage2 retains the
+lowest-BPP checkpoint, and Stage3 retains every 5000-step checkpoint. Benchmark
+JSON contains `psnr`, `bpp`, `latency_ms`, `lpips_vgg`, `lpips_alex`, and
+`dists`. Only Stage3 saves reconstructions, with one canonical recon archive
+per λ.
 
 Training metrics are written to `train_metrics.jsonl`, compact logs to
 `training.log`, and the exact run configuration to `run_manifest.json`.

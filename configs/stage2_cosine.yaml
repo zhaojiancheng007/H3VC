@@ -16,7 +16,7 @@ optimizer:
 train:
   batch_size: 4
   max_steps: 60000
-  num_workers: 8
+  num_workers: 4
   seed: 2026
   log_interval: 20
   checkpoint_interval: 5000

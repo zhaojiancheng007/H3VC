@@ -1,0 +1,103 @@
+{
+  "benchmark": "stage2_video_loading_internal_crop_ab",
+  "bpp": 0.09028870406637138,
+  "cohort_sha256": "c5b76a8998652283dc6572d0f75d8e2cd5628c80792032060dcab5c6e7e0a1ed",
+  "comparison": {
+    "decord": {
+      "mean_latency_speedup": 1.0864717089216034,
+      "p95_latency_speedup": 1.210126518638404,
+      "throughput_speedup": 1.1461413945032772
+    },
+    "opencv_resize_crop": {
+      "mean_latency_speedup": 3.392650379584703,
+      "p95_latency_speedup": 2.4903781418850404,
+      "throughput_speedup": 3.232559359285329
+    }
+  },
+  "decode_threads": 2,
+  "latency_ms": {
+    "decord": 1630.0019289938064,
+    "opencv": 1770.9509813394106,
+    "opencv_resize_crop": 521.9963106119394
+  },
+  "methods": {
+    "decord": {
+      "latency_max_ms": 6277.262078830972,
+      "latency_ms": 1630.0019289938064,
+      "latency_p50_ms": 1371.5105934534222,
+      "latency_p95_ms": 3729.2240699753165,
+      "throughput_sequences_per_second": 17.952099225047697,
+      "wall_seconds": 14.260170734953135
+    },
+    "opencv": {
+      "latency_max_ms": 5156.826168997213,
+      "latency_ms": 1770.9509813394106,
+      "latency_p50_ms": 1396.7343110125512,
+      "latency_p95_ms": 4512.83294102177,
+      "throughput_sequences_per_second": 15.66307552553575,
+      "wall_seconds": 16.34417197201401
+    },
+    "opencv_resize_crop": {
+      "latency_max_ms": 2754.175038775429,
+      "latency_ms": 521.9963106119394,
+      "latency_p50_ms": 361.5075165871531,
+      "latency_p95_ms": 1812.1075129602104,
+      "throughput_sequences_per_second": 50.63182138526356,
+      "wall_seconds": 5.056108846096322
+    }
+  },
+  "num_frames": 25,
+  "psnr": {
+    "decord": {
+      "compared_samples": 16,
+      "exact_match_count": 10,
+      "psnr": 45.31553610778009,
+      "psnr_min": 38.01597863657382,
+      "psnr_per_sample": [
+        44.92356810592536,
+        47.20091684847344,
+        null,
+        null,
+        47.347015700456446,
+        null,
+        45.87780183702339,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        48.52793551822806,
+        38.01597863657382,
+        null
+      ]
+    },
+    "opencv_resize_crop": {
+      "compared_samples": 16,
+      "exact_match_count": 0,
+      "psnr": 60.813140540612956,
+      "psnr_min": 59.1735256077585,
+      "psnr_per_sample": [
+        60.25490144734803,
+        61.593438473626904,
+        61.023156005752455,
+        60.21196622203447,
+        62.12096504915018,
+        60.487567233816776,
+        59.5711520359282,
+        60.06035161053428,
+        59.1735256077585,
+        60.70001159706266,
+        64.53176385192181,
+        60.01898455004561,
+        60.68057610695867,
+        61.00847854718761,
+        60.66670328379294,
+        60.90670702688816
+      ]
+    }
+  },
+  "sample_count": 256,
+  "schema_version": 1,
+  "workers": 32
+}

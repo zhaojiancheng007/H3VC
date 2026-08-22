@@ -14,7 +14,10 @@ venv/
 
 # Datasets, checkpoints, and experiment outputs
 /data/
-/outputs/
+/outputs/*
+!/outputs/benchmarks/
+!/outputs/benchmarks/**
+/results/
 /pretrained_ckpts/
 *.pt
 *.pth

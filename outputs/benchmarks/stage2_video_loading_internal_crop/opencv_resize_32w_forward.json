@@ -1,0 +1,65 @@
+{
+  "benchmark": "stage2_video_loading_internal_crop_ab",
+  "bpp": 0.09028870406637138,
+  "cohort_sha256": "c5b76a8998652283dc6572d0f75d8e2cd5628c80792032060dcab5c6e7e0a1ed",
+  "comparison": {
+    "opencv_resize_crop": {
+      "mean_latency_speedup": 3.773791120362455,
+      "p95_latency_speedup": 2.7793025672944034,
+      "throughput_speedup": 3.6389049194925835
+    }
+  },
+  "decode_threads": 2,
+  "latency_ms": {
+    "opencv": 1746.6756004405397,
+    "opencv_resize_crop": 462.84374114293314
+  },
+  "methods": {
+    "opencv": {
+      "latency_max_ms": 5053.780033020303,
+      "latency_ms": 1746.6756004405397,
+      "latency_p50_ms": 1375.1392340054736,
+      "latency_p95_ms": 4578.545259078965,
+      "throughput_sequences_per_second": 15.452427440466911,
+      "wall_seconds": 16.566976352827623
+    },
+    "opencv_resize_crop": {
+      "latency_max_ms": 2376.644985983148,
+      "latency_ms": 462.84374114293314,
+      "latency_p50_ms": 321.8839186010882,
+      "latency_p95_ms": 1647.3720108624548,
+      "throughput_sequences_per_second": 56.229914231217236,
+      "wall_seconds": 4.552736803889275
+    }
+  },
+  "num_frames": 25,
+  "psnr": {
+    "opencv_resize_crop": {
+      "compared_samples": 16,
+      "exact_match_count": 0,
+      "psnr": 60.813140540612956,
+      "psnr_min": 59.1735256077585,
+      "psnr_per_sample": [
+        60.25490144734803,
+        61.593438473626904,
+        61.023156005752455,
+        60.21196622203447,
+        62.12096504915018,
+        60.487567233816776,
+        59.5711520359282,
+        60.06035161053428,
+        59.1735256077585,
+        60.70001159706266,
+        64.53176385192181,
+        60.01898455004561,
+        60.68057610695867,
+        61.00847854718761,
+        60.66670328379294,
+        60.90670702688816
+      ]
+    }
+  },
+  "sample_count": 256,
+  "schema_version": 1,
+  "workers": 32
+}

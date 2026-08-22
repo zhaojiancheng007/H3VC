@@ -34,29 +34,33 @@ from training.config_stage2_cosine import (
     load_stage2_config,
     stage2_config_dict,
 )
-from training.stage_data import (
+from training.stage_data_fast import (
     DEFAULT_DATASET_FORMAT,
     DEFAULT_DATASET_ROOT,
     DEFAULT_METADATA,
-    build_stage_dataset,
+    build_stage_dataset_fast as build_stage_dataset,
 )
+from training.checkpoint_config_fast import assert_fast_loader_resume_config
 from training.distributed_runtime import (
     DistributedEpochIterator,
     ResumableDistributedBatchSampler,
     all_reduce_mean,
     append_log,
-    build_video_dataloader,
     capture_rng_state,
     collective_error,
     rank_zero_output_setup,
     restore_rng_state,
 )
+from training.distributed_runtime_fast import (
+    FAST_PREFETCH_FACTOR,
+    FAST_WORKERS_PER_RANK,
+    build_video_dataloader_fast as build_video_dataloader,
+)
 
-from training.periodic_benchmarks import (
-    BENCHMARKS_BY_RANK,
-    benchmark_for_rank,
-    evaluation_command as base_evaluation_command,
-    evaluation_environment,
+from training.evaluation_categorical_distributed import merge_evaluation_shards
+from training.periodic_benchmarks import evaluation_environment
+from training.periodic_benchmarks_gaussian import (
+    distributed_evaluation_command as evaluation_command,
 )
 
 
@@ -68,13 +72,15 @@ def parse_args() -> argparse.Namespace:
         description="Train one 4096-way entropy model for a Stage1 VQ tokenizer"
     )
     parser.add_argument(
-        "-c", "--config", default=str(PROJECT_ROOT / "configs/stage2_cosine.yaml")
+        "-c",
+        "--config",
+        default=str(PROJECT_ROOT / "configs/stage2_cosine.yaml"),
     )
     parser.add_argument("--dataset-root", default=DEFAULT_DATASET_ROOT)
     parser.add_argument(
         "--dataset-format",
         default=DEFAULT_DATASET_FORMAT,
-        choices=("openvid", "trainable_jsons"),
+        choices=("trainable_jsons",),
     )
     parser.add_argument("--metadata", default=DEFAULT_METADATA)
     parser.add_argument("--tokenizer-checkpoint", required=True)
@@ -117,25 +123,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--resume")
     parser.add_argument("--stop-after-steps", type=int)
     return parser.parse_args()
-
-
-def evaluation_command(
-    args: argparse.Namespace,
-    stage: int,
-    checkpoint_path: Path,
-    dataset: str,
-    dataset_root: Path,
-    output_path: Path,
-    project_root: Path,
-) -> list[str]:
-    command = base_evaluation_command(
-        args, stage, checkpoint_path, dataset, dataset_root, output_path, project_root
-    )
-    evaluator = project_root / "scripts" / "evaluate_stage2_entropy_uvg.py"
-    command[command.index(str(evaluator))] = str(
-        project_root / "scripts" / "evaluate_stage2_cosine.py"
-    )
-    return command
 
 
 def scheduler_scale(config: Stage2Config, scheduler_step: int) -> float:
@@ -222,34 +209,41 @@ def evaluate_checkpoint_in_subprocess(
     *,
     rank: int,
     local_rank: int,
+    world_size: int,
     device: torch.device,
 ) -> DistributedDataParallel:
+    cpu = torch.device("cpu")
+    tokenizer.to(cpu)
+    model.to(cpu)
+    move_optimizer_state(optimizer, cpu)
     gc.collect()
     torch.cuda.empty_cache()
     dist.barrier()
 
-    benchmark = benchmark_for_rank(args, rank, evaluation_dir)
-    if benchmark is not None:
-        dataset, dataset_root, output_path = benchmark
-        tokenizer.to("cpu")
-        model.to("cpu")
-        move_optimizer_state(optimizer, torch.device("cpu"))
-        gc.collect()
-        torch.cuda.empty_cache()
-        subprocess.run(
-            evaluation_command(
-                args, 2, checkpoint_path, dataset, dataset_root, output_path, PROJECT_ROOT
-            ),
-            cwd=PROJECT_ROOT,
-            env=evaluation_environment(local_rank),
-            check=True,
-        )
-        tokenizer.to(device)
-        model.to(device)
-        move_optimizer_state(optimizer, device)
-        torch.cuda.empty_cache()
-
+    subprocess.run(
+        evaluation_command(
+            args, 2, checkpoint_path, evaluation_dir, rank, world_size, PROJECT_ROOT
+        ),
+        cwd=PROJECT_ROOT,
+        env=evaluation_environment(local_rank),
+        check=True,
+    )
     dist.barrier()
+    if rank == 0:
+        shards = []
+        for shard_rank in range(world_size):
+            shard_path = evaluation_dir / "shards" / f"rank_{shard_rank:02d}.json"
+            with shard_path.open("r", encoding="utf-8") as handle:
+                shards.append(json.load(handle))
+        evaluations = merge_evaluation_shards(shards)
+        for dataset, evaluation in evaluations.items():
+            write_json(evaluation_dir / f"{dataset}.json", evaluation)
+    dist.barrier()
+
+    tokenizer.to(device)
+    model.to(device)
+    move_optimizer_state(optimizer, device)
+    torch.cuda.empty_cache()
     return DistributedDataParallel(
         model,
         device_ids=[local_rank],
@@ -313,8 +307,6 @@ def run(args: argparse.Namespace) -> None:
     rank = int(os.environ["RANK"])
     local_rank = int(os.environ["LOCAL_RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
-    if world_size < len(BENCHMARKS_BY_RANK):
-        raise ValueError("Periodic evaluation requires at least 3 distributed ranks")
     torch.cuda.set_device(local_rank)
     device = torch.device("cuda", local_rank)
     config = load_stage2_config(args.config)
@@ -383,8 +375,9 @@ def run(args: argparse.Namespace) -> None:
     start_epoch = 0
     start_batch = 0
     if resume is not None:
-        if resume["config"] != config_payload:
-            raise ValueError("Stage2 resume config changed")
+        assert_fast_loader_resume_config(
+            resume["config"], config_payload, stage="Stage2"
+        )
         if resume["tokenizer"] != loaded.name:
             raise ValueError("Stage2 resume tokenizer changed")
         if Path(resume["tokenizer_checkpoint"]) != loaded.checkpoint:
@@ -443,6 +436,12 @@ def run(args: argparse.Namespace) -> None:
                 "global_batch_size": global_batch_size,
                 "checkpoint_policy": config.train.checkpoint_policy,
                 "learning_rate_scheduler": "cosine_annealing",
+                "data_loader": {
+                    "implementation": "opencv_worker_resize_crop",
+                    "workers_per_rank": FAST_WORKERS_PER_RANK,
+                    "prefetch_factor": FAST_PREFETCH_FACTOR,
+                    "persistent_workers": True,
+                },
                 "config": config_payload,
             },
         )
@@ -548,6 +547,7 @@ def run(args: argparse.Namespace) -> None:
                 optimizer,
                 rank=rank,
                 local_rank=local_rank,
+                world_size=world_size,
                 device=device,
             )
             if rank == 0:
