@@ -1,42 +1,77 @@
 # ARCodec Train-Eval 固定流程
 
 本文固定当前实验流水线。后续训练、定期评测、恢复训练和结果归档均以本文为准。
-基线入口 `scripts/stage1.py`、`scripts/stage2.py`、`scripts/stage3.py` 不属于本文流程。
+每个 Stage 只保留一个正式训练入口。
 
 ## 1. 唯一运行入口
 
 | Stage | 训练入口 | 配置 | 训练对象 |
 | --- | --- | --- | --- |
-| Stage1 | `scripts/stage1_cosine.py` | `configs/stage1_cosine.yaml` | tokenizer、projection、EMA-VQ |
-| Stage2 | `scripts/stage2_cosine.py` | `configs/stage2_cosine.yaml` | categorical entropy model，tokenizer 冻结 |
-| Stage3 | `scripts/stage3_cosine.py` | 对应 λ 的 cosine config | tokenizer、entropy model 与 discriminator 联合训练 |
+| Stage1 | `scripts/stage1.py` | `configs/stage1.yaml` | tokenizer、projection、EMA-VQ |
+| Stage2 | `scripts/stage2.py` | `configs/stage2.yaml` | categorical entropy model，tokenizer 冻结 |
+| Stage3 | `scripts/stage3.py` | `configs/stage3.yaml` 或对应 λ 的 config | tokenizer 与 entropy model 联合训练 |
 
 三个入口统一使用：
 
 - `world_size` 卡 DDP 训练，GPU 数由 `torchrun --nproc_per_node` 指定；
 - high-throughput OpenCV worker loader；
 - cosine annealing learning-rate scheduler；
+- 每卡 4 workers、prefetch factor 2、pinned memory 和 persistent workers；
+- 只对明确的 `VideoDecodeError` 确定性替换样本，最多 16 次，并记录到
+  `<output-dir>/rejected_samples.jsonl`；其他异常直接失败；
 - 每 `checkpoint_interval` step 保存 checkpoint，并使用全部训练 GPU 执行 Gaussian eval；
 - eval 完整成功后才恢复训练。
 
-当前 λ=18 的 Stage3 配置为 `configs/stage3_lambda18_cosine.yaml`。
+Stage2 固定 `batch_size=2`/GPU。Stage3 的 λ 由 config 中
+`loss.rate_weight` 显式指定，每个 λ 对应一个独立 output directory。Stage3
+统一不训练 discriminator，canonical config 不包含 GAN 字段。
 
-## 2. 训练命令模板
+## 2. 两台机器的绝对路径
+
+| 项目 | 原 zjc 环境 | 当前 root 训练容器 |
+| --- | --- | --- |
+| SSH | `zjc@10.127.48.3 -p 31172` | `root@10.127.48.3 -p 31172` |
+| repo | `/home/zjc/ARCodec-` | `/zjc/ARCodec` |
+| dataset root | `/ddn/gemini` | `/ddn/team/shared/gemini` |
+| metadata | `/home/zjc/ARCodec-/data/trainable_jsons_v1_filtered_decode_failures_step0` | `/zjc/ARCodec/data/trainable_jsons_v1_filtered_decode_failures_step0` |
+| UVG | `/luojix/data/UVG` | `/luojx/data/UVG` |
+| MCL-JCV | `/luojix/data/MCL-JCV/figure4_bt709_first96` | `/luojx/data/MCL-JCV/figure4_bt709_first96` |
+| HEVC-B | `/luojix/data/HEVC-B/figure4_bt709_first96` | `/luojx/data/HEVC-B/figure4_bt709_first96` |
+| MiniMax-H3 | `/home/zjc/ARCodec-/pretrained_ckpts/MiniMax-H3/FL2VA/video_vae` | `/data/heli/model/MiniMax-H3/FL2VA/video_vae` |
+
+绝对路径不写入共享 config 默认值。每次训练命令必须显式传入
+`--dataset-root`、`--metadata`、三个 eval root 和 `--minimax-h3-model-dir`。
+
+## 3. 训练命令模板
+
+以下命令使用当前 root 训练容器路径。
 
 ### Stage1
 
 ~~~bash
-torchrun --standalone --nproc_per_node=<gpu_count> scripts/stage1_cosine.py \
+torchrun --standalone --nproc_per_node=<gpu_count> scripts/stage1.py \
   --tokenizer minimax_h3 \
-  -c configs/stage1_cosine.yaml \
+  -c configs/stage1.yaml \
+  --dataset-root /ddn/team/shared/gemini \
+  --metadata /zjc/ARCodec/data/trainable_jsons_v1_filtered_decode_failures_step0 \
+  --uvg-root /luojx/data/UVG \
+  --mcl-jcv-root /luojx/data/MCL-JCV/figure4_bt709_first96 \
+  --hevc-b-root /luojx/data/HEVC-B/figure4_bt709_first96 \
+  --minimax-h3-model-dir /data/heli/model/MiniMax-H3/FL2VA/video_vae \
   --output-dir outputs/<stage1_run>
 ~~~
 
 ### Stage2
 
 ~~~bash
-torchrun --standalone --nproc_per_node=<gpu_count> scripts/stage2_cosine.py \
-  -c configs/stage2_cosine.yaml \
+torchrun --standalone --nproc_per_node=<gpu_count> scripts/stage2.py \
+  -c configs/stage2.yaml \
+  --dataset-root /ddn/team/shared/gemini \
+  --metadata /zjc/ARCodec/data/trainable_jsons_v1_filtered_decode_failures_step0 \
+  --uvg-root /luojx/data/UVG \
+  --mcl-jcv-root /luojx/data/MCL-JCV/figure4_bt709_first96 \
+  --hevc-b-root /luojx/data/HEVC-B/figure4_bt709_first96 \
+  --minimax-h3-model-dir /data/heli/model/MiniMax-H3/FL2VA/video_vae \
   --tokenizer-checkpoint outputs/<stage1_run>/checkpoints/checkpoint_best.pt \
   --output-dir outputs/<stage2_run>
 ~~~
@@ -44,8 +79,14 @@ torchrun --standalone --nproc_per_node=<gpu_count> scripts/stage2_cosine.py \
 ### Stage3
 
 ~~~bash
-torchrun --standalone --nproc_per_node=<gpu_count> scripts/stage3_cosine.py \
-  -c configs/stage3_lambda18_cosine.yaml \
+torchrun --standalone --nproc_per_node=<gpu_count> scripts/stage3.py \
+  -c configs/stage3.yaml \
+  --dataset-root /ddn/team/shared/gemini \
+  --metadata /zjc/ARCodec/data/trainable_jsons_v1_filtered_decode_failures_step0 \
+  --uvg-root /luojx/data/UVG \
+  --mcl-jcv-root /luojx/data/MCL-JCV/figure4_bt709_first96 \
+  --hevc-b-root /luojx/data/HEVC-B/figure4_bt709_first96 \
+  --minimax-h3-model-dir /data/heli/model/MiniMax-H3/FL2VA/video_vae \
   --tokenizer-checkpoint outputs/<stage1_run>/checkpoints/<stage1_checkpoint>.pt \
   --entropy-checkpoint outputs/<stage2_run>/checkpoints/<stage2_checkpoint>.pt \
   --output-dir outputs/<stage3_lambda18_run>
@@ -61,12 +102,16 @@ torchrun --standalone --nproc_per_node=<gpu_count> scripts/stage3_cosine.py \
 --resume outputs/<run>/checkpoints/<checkpoint>.pt
 ~~~
 
-Stage3 的 `--resume` 恢复模型、discriminator、两个 optimizer、数据位置和各 rank
-RNG 状态；cosine scheduler 根据 checkpoint step 重建到对应位置。
-`--init-checkpoint` 只加载模型与 discriminator 作为初始化，不恢复 optimizer、
+Stage1/2/3 的 `--resume` 恢复模型、optimizer、数据位置和各 rank RNG 状态；
+cosine scheduler 从 checkpoint step 对应位置继续。Stage3 的
+`--init-checkpoint` 只加载 joint model 作为初始化，不恢复 optimizer、
 数据位置或 RNG 状态。两者不能同时使用。
 
-## 3. Checkpoint 边界状态机
+checkpoint 内记录的 source checkpoint 绝对路径与当前显式参数不一致时默认失败。
+只有确认文件是跨机器搬迁的同一份 checkpoint 时，才增加
+`--allow-checkpoint-relocation`；该选择和实际发生的迁移会写入 manifest。
+
+## 4. Checkpoint 边界状态机
 
 默认 `checkpoint_interval=5000`。到达 checkpoint step 后执行以下固定顺序：
 
@@ -90,7 +135,7 @@ RNG 状态；cosine scheduler 根据 checkpoint step 重建到对应位置。
 任何 eval subprocess 非零退出都会使 `subprocess.run(..., check=True)` 直接失败。
 此时不合并部分指标、不替换 canonical recon、也不恢复训练。
 
-## 4. 多卡 Eval 分片
+## 5. 多卡 Eval 分片
 
 共享评测集合共 42 个视频：
 
@@ -116,7 +161,7 @@ Eval 入口：
 每个 subprocess 只暴露一张物理 GPU，并在其中使用 `cuda:0`。共享命令构造位于
 `training/periodic_benchmarks_gaussian.py`。
 
-## 5. Eval 协议
+## 6. Eval 协议
 
 MiniMax-H3 的固定协议为：
 
@@ -153,7 +198,7 @@ Stage 间 rate 口径不同：
 `latency_ms` 统计 encode、VQ assignment、rate estimation 和 decode，按输出帧平均。
 它不包含 PNG 写盘，也不包含 LPIPS/DISTS 计算。
 
-## 6. Shard 合并条件
+## 7. Shard 合并条件
 
 Rank 0 只在以下条件全部成立时合并：
 
@@ -168,7 +213,7 @@ Rank 0 只在以下条件全部成立时合并：
 合并逻辑位于 `training/evaluation_categorical_distributed.py`。不允许缺视频后继续、
 不允许用旧结果补缺失 shard，也不允许用默认值生成 aggregate。
 
-## 7. Recon 归档规则
+## 8. Recon 归档规则
 
 只有 Stage3 保存 recon。Stage1 和 Stage2 只保存结构化指标。
 
@@ -202,7 +247,7 @@ step 目录继续保留每个 checkpoint 的指标 JSON，但不保留重复 rec
 
 覆盖只发生在全部 `world_size` 个 shard 成功之后。失败 eval 的部分 recon 不得替换上一份完整结果。
 
-## 8. 输出目录
+## 9. 输出目录
 
 ~~~text
 outputs/<run>/
@@ -237,13 +282,13 @@ Checkpoint 策略：
 
 Stage1/2 的非最优 candidate checkpoint 会删除；结构化 eval JSON 仍保留。
 
-## 9. 完整实验 Setting 归档规则
+## 10. 完整实验 Setting 归档规则
 
 归档单位是一次完整实验 setting，不是单独的 Stage 或单独的 eval。一个完整 setting
 必须包含一个确定的 Stage1、一个由该 Stage1 训练的 Stage2，以及一个或多个使用这组
 Stage1/Stage2 checkpoint 的 Stage3 λ 分支。
 
-### 9.1 命名和目录
+### 10.1 命名和目录
 
 归档根目录固定为：
 
@@ -287,7 +332,7 @@ results/<setting_name>/
 Stage1/Stage2 checkpoint 的不同 λ 必须放在同一个 setting 的 `stage3/` 下，不能拆成
 多个平行归档根目录。
 
-### 9.2 Checkpoint 保留
+### 10.2 Checkpoint 保留
 
 - Stage1 和 Stage2 被 Stage3 引用的 source checkpoint 是归档的一部分，必须保留，
   不得因清理 `outputs` 或 checkpoint 去重而删除；
@@ -299,7 +344,7 @@ Stage1/Stage2 checkpoint 的不同 λ 必须放在同一个 setting 的 `stage3/
 - 删除任何 checkpoint 前必须先解析精确引用关系。存在引用不明确时直接停止，不允许
   猜测或通过 fallback 修复。
 
-### 9.3 Stage3 Eval 和 Recon
+### 10.3 Stage3 Eval 和 Recon
 
 每个 λ 的正式 eval 必须放在与 checkpoint step 对应的目录：
 
@@ -323,7 +368,7 @@ stage3/lambda_<value>/eval/step_<step>/
 
 Stage1 和 Stage2 不归档 recon，只保留 checkpoint、训练记录和结构化 eval metrics。
 
-### 9.4 experiment.json
+### 10.4 experiment.json
 
 每个 setting 根目录必须包含可解析的 `experiment.json`，作为归档的结构化索引。它至少记录：
 
@@ -337,7 +382,7 @@ Stage1 和 Stage2 不归档 recon，只保留 checkpoint、训练记录和结构
 索引中的路径必须相对于 setting 根目录或对应的 Stage3 eval 根目录，不使用机器相关的
 绝对路径。
 
-### 9.5 移动和兼容路径
+### 10.5 移动和兼容路径
 
 已完成的实验实体目录从 `outputs` 移动到 `results/<setting_name>`。同一文件系统内使用
 rename，不复制大 checkpoint 或 recon。若训练脚本、manifest 或 resume 流程仍依赖旧的
@@ -347,7 +392,7 @@ rename，不复制大 checkpoint 或 recon。若训练脚本、manifest 或 resu
 移动前必须确认没有 train/eval 进程仍在写目标目录。移动后必须验证符号链接可以解析到
 真实 checkpoint，不能留下断链，也不能使用缺失路径的静默 fallback。
 
-### 9.6 归档完成条件
+### 10.6 归档完成条件
 
 一次 setting 只有在以下条件全部满足后才算归档完成：
 
@@ -363,15 +408,15 @@ rename，不复制大 checkpoint 或 recon。若训练脚本、manifest 或 resu
 任何一项失败都必须停止归档并暴露具体不一致；不得移动部分结果后生成占位索引，也不得
 用旧 metrics 或旧 recon 补齐缺失数据。
 
-## 10. Resume 一致性规则
+## 11. Resume 一致性规则
 
 各 Stage 的恢复状态为：
 
 | Stage | Checkpoint 中保存的恢复状态 |
 | --- | --- |
-| Stage1 | model、optimizer、step；学习率和数据 epoch/batch position 由 step 确定性重建 |
+| Stage1 | model、optimizer、数据 epoch/batch position、各 rank RNG state |
 | Stage2 | model、optimizer、scheduler、数据 epoch/batch position、各 rank RNG state |
-| Stage3 | model、discriminator、两个 optimizer、数据 epoch/batch position、各 rank RNG state；scheduler 由 step 重建 |
+| Stage3 | joint model、optimizer、数据 epoch/batch position、各 rank RNG state；scheduler 由 step 重建 |
 
 恢复前必须满足：
 
@@ -394,7 +439,7 @@ Resume config 比较只将 `train.num_workers` 视为 runtime-only 字段；其�
 
 不得直接忽略 step mismatch，也不得伪造缺失 checkpoint。
 
-## 11. 运行确认
+## 12. 运行确认
 
 一次 train-eval-resume 周期只有在以下条件同时满足时才算完成：
 
@@ -409,13 +454,13 @@ Resume config 比较只将 `train.num_workers` 视为 runtime-only 字段；其�
 
 只看到 tmux session 或 Python 进程不等于训练已经恢复，必须以新的 train metric 为准。
 
-## 12. 代码责任边界
+## 13. 代码责任边界
 
 | 责任 | 文件 |
 | --- | --- |
-| Stage1 train-eval orchestration | `scripts/stage1_cosine.py` |
-| Stage2 train-eval orchestration | `scripts/stage2_cosine.py` |
-| Stage3 train-eval-recon orchestration | `scripts/stage3_cosine.py` |
+| Stage1 train-eval orchestration | `scripts/stage1.py` |
+| Stage2 train-eval orchestration | `scripts/stage2.py` |
+| Stage3 train-eval-recon orchestration | `scripts/stage3.py` |
 | Gaussian distributed command | `training/periodic_benchmarks_gaussian.py` |
 | 42-video job、分片、指标与合并 | `training/evaluation_categorical_distributed.py` |
 | Gaussian tile decode | `tokenizer/gaussian_tile_decode.py` |

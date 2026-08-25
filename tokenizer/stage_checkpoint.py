@@ -38,7 +38,7 @@ def load_stage1_tokenizer(
 ) -> LoadedStage1Tokenizer:
     checkpoint = Path(checkpoint).resolve()
     payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
-    required = {
+    common = {
         "version",
         "stage",
         "step",
@@ -52,13 +52,15 @@ def load_stage1_tokenizer(
         "optimizer",
         "config",
     }
+    version = int(payload.get("version", -1))
+    required = common if version == 2 else common | {"training_state", "rng_states"}
     if set(payload) != required:
         raise ValueError(
             f"Stage1 checkpoint fields are {sorted(payload)}, "
-            f"expected version-2 fields {sorted(required)}"
+            f"expected version-{version} fields {sorted(required)}"
         )
-    if payload["version"] != 2 or payload["stage"] != 1:
-        raise ValueError("New Stage2/3 training requires a version-2 Stage1 checkpoint")
+    if version not in (2, 3) or payload["stage"] != 1:
+        raise ValueError("Stage2/3 training requires a version-2 or version-3 Stage1 checkpoint")
     name = payload["tokenizer"]
     spec = TOKENIZER_SPECS[name]
     if not checkpoint_input_frames_match(name, payload["input_frames"]):

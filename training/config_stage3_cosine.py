@@ -12,7 +12,6 @@ from entropy_model.config_categorical import CategoricalEntropyModelConfig
 
 @dataclass(frozen=True)
 class Stage3OptimizerConfig:
-    discriminator_learning_rate: float
     betas: tuple[float, float]
     grad_clip_norm: float
     tokenizer_learning_rate: float
@@ -26,8 +25,6 @@ class Stage3LossConfig:
     mse_weight: float
     lpips_weight: float
     commitment_weight: float
-    gan_start_step: int
-    gan_weight: float
     rate_weight: float
     temperature: float
 
@@ -90,15 +87,38 @@ def load_stage3_config(path: str | Path) -> Stage3Config:
     if not isinstance(raw, dict) or set(raw) != expected:
         raise ValueError(f"Stage3 config requires exactly {sorted(expected)}")
     optimizer = dict(raw["optimizer"])
+    loss = dict(raw["loss"])
+    legacy_keys = {
+        "discriminator_learning_rate",
+        "gan_start_step",
+        "gan_weight",
+    }
+    present_legacy_keys = (
+        (
+            {"discriminator_learning_rate"}
+            if "discriminator_learning_rate" in optimizer
+            else set()
+        )
+        | ({"gan_start_step"} if "gan_start_step" in loss else set())
+        | ({"gan_weight"} if "gan_weight" in loss else set())
+    )
+    if present_legacy_keys and present_legacy_keys != legacy_keys:
+        raise ValueError(
+            f"Legacy Stage3 GAN fields must appear together, got {sorted(present_legacy_keys)}"
+        )
+    if present_legacy_keys:
+        optimizer.pop("discriminator_learning_rate")
+        loss.pop("gan_start_step")
+        if float(loss.pop("gan_weight")) != 0:
+            raise ValueError("Legacy Stage3 config is compatible only when gan_weight=0")
     optimizer["betas"] = tuple(optimizer["betas"])
     config = Stage3Config(
         model=_construct(CategoricalEntropyModelConfig, dict(raw["model"])),
         optimizer=_construct(Stage3OptimizerConfig, optimizer),
-        loss=_construct(Stage3LossConfig, dict(raw["loss"])),
+        loss=_construct(Stage3LossConfig, loss),
         train=_construct(Stage3TrainConfig, dict(raw["train"])),
     )
     positive = (
-        config.optimizer.discriminator_learning_rate,
         config.optimizer.grad_clip_norm,
         config.loss.mse_weight,
         config.loss.lpips_weight,
@@ -113,8 +133,6 @@ def load_stage3_config(path: str | Path) -> Stage3Config:
     )
     if min(positive) <= 0:
         raise ValueError(f"Stage3 values must be positive: {config}")
-    if config.loss.gan_weight < 0:
-        raise ValueError("gan_weight must be non-negative")
     if not (
         config.optimizer.tokenizer_learning_rate > config.optimizer.tokenizer_eta_min >= 0
         and config.optimizer.entropy_learning_rate > config.optimizer.entropy_eta_min >= 0
@@ -122,6 +140,4 @@ def load_stage3_config(path: str | Path) -> Stage3Config:
         raise ValueError("Cosine LR requires each initial rate to exceed eta_min >= 0")
     if config.train.max_steps <= 1:
         raise ValueError("Cosine LR requires max_steps > 1")
-    if not 0 <= config.loss.gan_start_step < config.train.max_steps:
-        raise ValueError("gan_start_step must occur during Stage3 training")
     return config

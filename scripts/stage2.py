@@ -18,7 +18,6 @@ import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data.distributed import DistributedSampler
-from tqdm import tqdm
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -28,35 +27,39 @@ from entropy_model.model_categorical import CategoricalEntropyModel
 from metrics.reporting import write_json
 from tokenizer.stage_checkpoint import load_stage1_tokenizer
 from training.training_state import DDPTrainingState
-from training.config_stage2 import (
+from training.config_stage2_cosine import (
     Stage2Config,
     learning_rate_at_step,
     load_stage2_config,
     stage2_config_dict,
 )
-from training.stage_data import (
+from training.stage_data_fast import (
     DEFAULT_DATASET_FORMAT,
-    DEFAULT_DATASET_ROOT,
-    DEFAULT_METADATA,
-    build_stage_dataset,
+    build_stage_dataset_fast as build_stage_dataset,
 )
+from training.checkpoint_config_fast import assert_fast_loader_resume_config
+from training.checkpoint_paths import assert_checkpoint_reference
 from training.distributed_runtime import (
     DistributedEpochIterator,
+    IntervalProgress,
     ResumableDistributedBatchSampler,
     all_reduce_mean,
     append_log,
-    build_video_dataloader,
     capture_rng_state,
     collective_error,
     rank_zero_output_setup,
     restore_rng_state,
 )
+from training.distributed_runtime_fast import (
+    FAST_PREFETCH_FACTOR,
+    FAST_WORKERS_PER_RANK,
+    build_video_dataloader_fast as build_video_dataloader,
+)
 
-from training.periodic_benchmarks import (
-    BENCHMARKS_BY_RANK,
-    benchmark_for_rank,
-    evaluation_command,
-    evaluation_environment,
+from training.evaluation_categorical_distributed import merge_evaluation_shards
+from training.periodic_benchmarks import evaluation_environment
+from training.periodic_benchmarks_gaussian import (
+    distributed_evaluation_command as evaluation_command,
 )
 
 
@@ -68,25 +71,27 @@ def parse_args() -> argparse.Namespace:
         description="Train one 4096-way entropy model for a Stage1 VQ tokenizer"
     )
     parser.add_argument(
-        "-c", "--config", default=str(PROJECT_ROOT / "configs/stage2.yaml")
+        "-c",
+        "--config",
+        default=str(PROJECT_ROOT / "configs/stage2.yaml"),
     )
-    parser.add_argument("--dataset-root", default=DEFAULT_DATASET_ROOT)
+    parser.add_argument("--dataset-root", required=True)
     parser.add_argument(
         "--dataset-format",
         default=DEFAULT_DATASET_FORMAT,
-        choices=("openvid", "trainable_jsons"),
+        choices=("trainable_jsons",),
     )
-    parser.add_argument("--metadata", default=DEFAULT_METADATA)
+    parser.add_argument("--metadata", required=True)
     parser.add_argument("--tokenizer-checkpoint", required=True)
     parser.add_argument("--output-dir", required=True)
-    parser.add_argument("--uvg-root", default="/luojix/data/UVG")
+    parser.add_argument("--uvg-root", required=True)
     parser.add_argument(
         "--mcl-jcv-root",
-        default="/luojix/data/MCL-JCV/figure4_bt709_first96",
+        required=True,
     )
     parser.add_argument(
         "--hevc-b-root",
-        default="/luojix/data/HEVC-B/figure4_bt709_first96",
+        required=True,
     )
     parser.add_argument("--wan-repo", default=str(PROJECT_ROOT / "Wan2.1"))
     parser.add_argument(
@@ -112,17 +117,23 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--minimax-h3-model-dir",
-        default=str(PROJECT_ROOT / "pretrained_ckpts/MiniMax-H3/FL2VA/video_vae"),
+        required=True,
     )
     parser.add_argument("--resume")
+    parser.add_argument(
+        "--allow-checkpoint-relocation",
+        action="store_true",
+        help="Accept explicitly supplied source checkpoints as relocated exact copies",
+    )
     parser.add_argument("--stop-after-steps", type=int)
     return parser.parse_args()
 
 
 def scheduler_scale(config: Stage2Config, scheduler_step: int) -> float:
+    schedule_step = min(scheduler_step + 1, config.train.max_steps)
     return (
-        learning_rate_at_step(config.optimizer, scheduler_step + 1)
-        / config.optimizer.learning_rate_schedule[0][1]
+        learning_rate_at_step(config.optimizer, config.train.max_steps, schedule_step)
+        / config.optimizer.learning_rate
     )
 
 
@@ -202,34 +213,41 @@ def evaluate_checkpoint_in_subprocess(
     *,
     rank: int,
     local_rank: int,
+    world_size: int,
     device: torch.device,
 ) -> DistributedDataParallel:
+    cpu = torch.device("cpu")
+    tokenizer.to(cpu)
+    model.to(cpu)
+    move_optimizer_state(optimizer, cpu)
     gc.collect()
     torch.cuda.empty_cache()
     dist.barrier()
 
-    benchmark = benchmark_for_rank(args, rank, evaluation_dir)
-    if benchmark is not None:
-        dataset, dataset_root, output_path = benchmark
-        tokenizer.to("cpu")
-        model.to("cpu")
-        move_optimizer_state(optimizer, torch.device("cpu"))
-        gc.collect()
-        torch.cuda.empty_cache()
-        subprocess.run(
-            evaluation_command(
-                args, 2, checkpoint_path, dataset, dataset_root, output_path, PROJECT_ROOT
-            ),
-            cwd=PROJECT_ROOT,
-            env=evaluation_environment(local_rank),
-            check=True,
-        )
-        tokenizer.to(device)
-        model.to(device)
-        move_optimizer_state(optimizer, device)
-        torch.cuda.empty_cache()
-
+    subprocess.run(
+        evaluation_command(
+            args, 2, checkpoint_path, evaluation_dir, rank, world_size, PROJECT_ROOT
+        ),
+        cwd=PROJECT_ROOT,
+        env=evaluation_environment(local_rank),
+        check=True,
+    )
     dist.barrier()
+    if rank == 0:
+        shards = []
+        for shard_rank in range(world_size):
+            shard_path = evaluation_dir / "shards" / f"rank_{shard_rank:02d}.json"
+            with shard_path.open("r", encoding="utf-8") as handle:
+                shards.append(json.load(handle))
+        evaluations = merge_evaluation_shards(shards)
+        for dataset, evaluation in evaluations.items():
+            write_json(evaluation_dir / f"{dataset}.json", evaluation)
+    dist.barrier()
+
+    tokenizer.to(device)
+    model.to(device)
+    move_optimizer_state(optimizer, device)
+    torch.cuda.empty_cache()
     return DistributedDataParallel(
         model,
         device_ids=[local_rank],
@@ -293,11 +311,13 @@ def run(args: argparse.Namespace) -> None:
     rank = int(os.environ["RANK"])
     local_rank = int(os.environ["LOCAL_RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
-    if world_size < len(BENCHMARKS_BY_RANK):
-        raise ValueError("Periodic evaluation requires at least 3 distributed ranks")
     torch.cuda.set_device(local_rank)
     device = torch.device("cuda", local_rank)
     config = load_stage2_config(args.config)
+    if config.train.batch_size != 2:
+        raise ValueError(
+            f"Canonical Stage2 requires batch_size=2 per GPU, got {config.train.batch_size}"
+        )
     config_payload = stage2_config_dict(config)
     global_batch_size = config.train.batch_size * world_size
 
@@ -349,7 +369,7 @@ def run(args: argparse.Namespace) -> None:
     model = CategoricalEntropyModel(config.model).to(device)
     optimizer = torch.optim.AdamW(
         model.parameters(),
-        lr=config.optimizer.learning_rate_schedule[0][1],
+        lr=config.optimizer.learning_rate,
         betas=config.optimizer.betas,
         weight_decay=config.optimizer.weight_decay,
     )
@@ -359,16 +379,22 @@ def run(args: argparse.Namespace) -> None:
     )
 
     resume = None if args.resume is None else load_checkpoint(args.resume)
+    checkpoint_relocated = False
     start_step = 0
     start_epoch = 0
     start_batch = 0
     if resume is not None:
-        if resume["config"] != config_payload:
-            raise ValueError("Stage2 resume config changed")
+        assert_fast_loader_resume_config(
+            resume["config"], config_payload, stage="Stage2"
+        )
         if resume["tokenizer"] != loaded.name:
             raise ValueError("Stage2 resume tokenizer changed")
-        if Path(resume["tokenizer_checkpoint"]) != loaded.checkpoint:
-            raise ValueError("Stage2 resume Stage1 checkpoint changed")
+        checkpoint_relocated = assert_checkpoint_reference(
+            resume["tokenizer_checkpoint"],
+            loaded.checkpoint,
+            label="Stage2 resume Stage1 checkpoint",
+            allow_relocation=args.allow_checkpoint_relocation,
+        )
         state = DDPTrainingState(**resume["training_state"])
         if state.world_size != world_size or state.global_batch_size != global_batch_size:
             raise ValueError("Stage2 resume distributed batch changed")
@@ -422,16 +448,25 @@ def run(args: argparse.Namespace) -> None:
                 "batch_size_per_gpu": config.train.batch_size,
                 "global_batch_size": global_batch_size,
                 "checkpoint_policy": config.train.checkpoint_policy,
+                "learning_rate_scheduler": "cosine_annealing",
+                "checkpoint_relocation_allowed": args.allow_checkpoint_relocation,
+                "checkpoint_relocated": checkpoint_relocated,
+                "data_loader": {
+                    "implementation": "opencv_worker_resize_crop",
+                    "workers_per_rank": FAST_WORKERS_PER_RANK,
+                    "prefetch_factor": FAST_PREFETCH_FACTOR,
+                    "persistent_workers": True,
+                },
                 "config": config_payload,
             },
         )
     metrics_path = output_dir / "train_metrics.jsonl"
     log_path = output_dir / "training.log"
-    progress = tqdm(
+    progress = IntervalProgress(
         total=stop_step,
         initial=start_step,
         desc=f"Stage2 {loaded.name} entropy",
-        dynamic_ncols=True,
+        interval=config.train.log_interval,
     ) if rank == 0 else None
     model.train()
 
@@ -527,6 +562,7 @@ def run(args: argparse.Namespace) -> None:
                 optimizer,
                 rank=rank,
                 local_rank=local_rank,
+                world_size=world_size,
                 device=device,
             )
             if rank == 0:

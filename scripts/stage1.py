@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import asdict
 from datetime import timedelta
 import gc
 import json
@@ -18,7 +19,6 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data.distributed import DistributedSampler
-from tqdm import tqdm
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -35,31 +35,37 @@ from tokenizer.stage_backbones import (
     build_backbone,
     checkpoint_input_frames_match,
 )
-from training.config_stage1 import (
+from training.config_stage1_cosine import (
     learning_rate_at_step,
     learning_rate_schedule_dict,
     load_stage1_training_config,
     stage1_config_dict,
 )
-from training.stage_data import (
+from training.stage_data_fast import (
     DEFAULT_DATASET_FORMAT,
-    DEFAULT_DATASET_ROOT,
-    DEFAULT_METADATA,
-    build_stage_dataset,
+    build_stage_dataset_fast as build_stage_dataset,
 )
+from training.checkpoint_config_fast import assert_fast_loader_resume_config
+from training.training_state import DDPTrainingState
 from training.distributed_runtime import (
     DistributedEpochIterator,
+    IntervalProgress,
     ResumableDistributedBatchSampler,
     all_reduce_mean,
     append_log,
-    build_video_dataloader,
+    capture_rng_state,
     rank_zero_output_setup,
+    restore_rng_state,
 )
-from training.periodic_benchmarks import (
-    BENCHMARKS_BY_RANK,
-    benchmark_for_rank,
-    evaluation_command,
-    evaluation_environment,
+from training.distributed_runtime_fast import (
+    FAST_PREFETCH_FACTOR,
+    FAST_WORKERS_PER_RANK,
+    build_video_dataloader_fast as build_video_dataloader,
+)
+from training.evaluation_categorical_distributed import merge_evaluation_shards
+from training.periodic_benchmarks import evaluation_environment
+from training.periodic_benchmarks_gaussian import (
+    distributed_evaluation_command as evaluation_command,
 )
 from training.video_losses import chunked_video_lpips, create_lpips_vgg
 
@@ -68,6 +74,7 @@ MSE_WEIGHT = 1.0
 LPIPS_WEIGHT = 1.0
 LPIPS_FRAME_BATCH_SIZE = 16
 CHECKPOINT_INTERVAL = 5000
+CHECKPOINT_VERSION = 3
 
 
 
@@ -80,22 +87,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--dataset-format",
         default=DEFAULT_DATASET_FORMAT,
-        choices=("openvid", "trainable_jsons"),
+        choices=("trainable_jsons",),
     )
     parser.add_argument(
-        "-c", "--config", default=str(PROJECT_ROOT / "configs/stage1.yaml")
+        "-c",
+        "--config",
+        default=str(PROJECT_ROOT / "configs/stage1.yaml"),
     )
-    parser.add_argument("--dataset-root", default=DEFAULT_DATASET_ROOT)
-    parser.add_argument("--metadata", default=DEFAULT_METADATA)
+    parser.add_argument("--dataset-root", required=True)
+    parser.add_argument("--metadata", required=True)
     parser.add_argument("--output-dir", required=True)
-    parser.add_argument("--uvg-root", default="/luojix/data/UVG")
+    parser.add_argument("--uvg-root", required=True)
     parser.add_argument(
         "--mcl-jcv-root",
-        default="/luojix/data/MCL-JCV/figure4_bt709_first96",
+        required=True,
     )
     parser.add_argument(
         "--hevc-b-root",
-        default="/luojix/data/HEVC-B/figure4_bt709_first96",
+        required=True,
     )
     parser.add_argument("--wan-repo", default=str(PROJECT_ROOT / "Wan2.1"))
     parser.add_argument(
@@ -127,7 +136,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--minimax-h3-model-dir",
-        default=str(PROJECT_ROOT / "pretrained_ckpts/MiniMax-H3/FL2VA/video_vae"),
+        required=True,
     )
     parser.add_argument("--resume")
     return parser.parse_args()
@@ -156,34 +165,41 @@ def evaluate_checkpoint_in_subprocess(
     *,
     rank: int,
     local_rank: int,
+    world_size: int,
     device: torch.device,
 ) -> DistributedDataParallel:
+    cpu = torch.device("cpu")
+    model.to(cpu)
+    move_optimizer_state(optimizer, cpu)
+    lpips_metric.to(cpu)
     gc.collect()
     torch.cuda.empty_cache()
     dist.barrier()
 
-    benchmark = benchmark_for_rank(args, rank, evaluation_dir)
-    if benchmark is not None:
-        dataset, dataset_root, output_path = benchmark
-        model.to("cpu")
-        move_optimizer_state(optimizer, torch.device("cpu"))
-        lpips_metric.to("cpu")
-        gc.collect()
-        torch.cuda.empty_cache()
-        subprocess.run(
-            evaluation_command(
-                args, 1, checkpoint_path, dataset, dataset_root, output_path, PROJECT_ROOT
-            ),
-            cwd=PROJECT_ROOT,
-            env=evaluation_environment(local_rank),
-            check=True,
-        )
-        model.to(device)
-        move_optimizer_state(optimizer, device)
-        lpips_metric.to(device)
-        torch.cuda.empty_cache()
-
+    subprocess.run(
+        evaluation_command(
+            args, 1, checkpoint_path, evaluation_dir, rank, world_size, PROJECT_ROOT
+        ),
+        cwd=PROJECT_ROOT,
+        env=evaluation_environment(local_rank),
+        check=True,
+    )
     dist.barrier()
+    if rank == 0:
+        shards = []
+        for shard_rank in range(world_size):
+            shard_path = evaluation_dir / "shards" / f"rank_{shard_rank:02d}.json"
+            with shard_path.open("r", encoding="utf-8") as handle:
+                shards.append(json.load(handle))
+        evaluations = merge_evaluation_shards(shards)
+        for dataset, evaluation in evaluations.items():
+            write_json(evaluation_dir / f"{dataset}.json", evaluation)
+    dist.barrier()
+
+    model.to(device)
+    move_optimizer_state(optimizer, device)
+    lpips_metric.to(device)
+    torch.cuda.empty_cache()
     return DistributedDataParallel(
         model,
         device_ids=[local_rank],
@@ -201,26 +217,50 @@ def save_checkpoint(
     latent_channels: int,
     codebook_dim: int,
     config: dict,
+    *,
     step: int,
+    stream: DistributedEpochIterator,
+    world_size: int,
+    global_batch_size: int,
+    rank: int,
+    device: torch.device,
 ) -> None:
-    payload = {
-        "version": 2,
-        "stage": 1,
-        "step": step,
-        "tokenizer": tokenizer_name,
-        "input_frames": input_frames,
-        "latent_channels": latent_channels,
-        "quantizer_geometry": QUANTIZER_GEOMETRY,
-        "codebook_size": CODEBOOK_SIZE,
-        "codebook_dim": codebook_dim,
-        "model": model.state_dict(),
-        "optimizer": optimizer.state_dict(),
-        "config": config,
-    }
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.tmp")
-    torch.save(payload, temporary)
-    os.replace(temporary, path)
+    rng_states = [None] * world_size
+    dist.all_gather_object(rng_states, capture_rng_state(device))
+    positions = [None] * world_size
+    dist.all_gather_object(positions, stream.checkpoint_position())
+    if len(set(positions)) != 1:
+        raise RuntimeError(f"Ranks disagree on DataLoader position: {positions}")
+    if rank == 0:
+        state = DDPTrainingState(
+            step=step,
+            epoch=positions[0][0],
+            batch_in_epoch=positions[0][1],
+            max_steps=config["train"]["max_steps"],
+            world_size=world_size,
+            global_batch_size=global_batch_size,
+        )
+        payload = {
+            "version": CHECKPOINT_VERSION,
+            "stage": 1,
+            "step": step,
+            "tokenizer": tokenizer_name,
+            "input_frames": input_frames,
+            "latent_channels": latent_channels,
+            "quantizer_geometry": QUANTIZER_GEOMETRY,
+            "codebook_size": CODEBOOK_SIZE,
+            "codebook_dim": codebook_dim,
+            "model": model.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "config": config,
+            "training_state": asdict(state),
+            "rng_states": rng_states,
+        }
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_name(f".{path.name}.tmp")
+        torch.save(payload, temporary)
+        os.replace(temporary, path)
+    dist.barrier()
 
 
 def keep_best_lpips_checkpoint(
@@ -261,8 +301,6 @@ def run(args: argparse.Namespace) -> None:
     rank = int(os.environ["RANK"])
     local_rank = int(os.environ["LOCAL_RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
-    if world_size < len(BENCHMARKS_BY_RANK):
-        raise ValueError("Periodic evaluation requires at least 3 distributed ranks")
     torch.cuda.set_device(local_rank)
     device = torch.device("cuda", local_rank)
     spec = TOKENIZER_SPECS[args.tokenizer]
@@ -271,9 +309,12 @@ def run(args: argparse.Namespace) -> None:
     config_payload = stage1_config_dict(config)
     resume_payload = None
     start_step = 0
+    start_epoch = 0
+    start_batch = 0
+    global_batch_size = config.train.batch_size * world_size
     if args.resume is not None:
         resume_payload = torch.load(args.resume, map_location="cpu", weights_only=False)
-        required = {
+        common = {
             "version",
             "stage",
             "step",
@@ -287,11 +328,15 @@ def run(args: argparse.Namespace) -> None:
             "optimizer",
             "config",
         }
+        version = int(resume_payload.get("version", -1))
+        required = common if version == 2 else common | {"training_state", "rng_states"}
         if set(resume_payload) != required:
             raise ValueError(
                 f"Stage1 checkpoint fields are {sorted(resume_payload)}, "
                 f"expected {sorted(required)}"
             )
+        if version not in (2, CHECKPOINT_VERSION) or resume_payload["stage"] != 1:
+            raise ValueError("Expected a version-2 or version-3 Stage1 checkpoint")
         if resume_payload["tokenizer"] != args.tokenizer:
             raise ValueError("Stage1 resume tokenizer changed")
         if not checkpoint_input_frames_match(
@@ -310,9 +355,16 @@ def run(args: argparse.Namespace) -> None:
         )
         if checkpoint_geometry != expected_geometry:
             raise ValueError(f"Stage1 resume geometry changed: {checkpoint_geometry}")
-        if resume_payload["config"] != config_payload:
-            raise ValueError("Stage1 resume config changed")
+        assert_fast_loader_resume_config(
+            resume_payload["config"], config_payload, stage="Stage1"
+        )
         start_step = int(resume_payload["step"])
+        if version == CHECKPOINT_VERSION:
+            state = DDPTrainingState(**resume_payload["training_state"])
+            if state.world_size != world_size or state.global_batch_size != global_batch_size:
+                raise ValueError("Stage1 resume distributed batch changed")
+            start_epoch = state.epoch
+            start_batch = state.batch_in_epoch
 
     random.seed(config.train.seed + rank)
     np.random.seed(config.train.seed + rank)
@@ -353,9 +405,10 @@ def run(args: argparse.Namespace) -> None:
         loader_generator,
         num_workers=config.train.num_workers,
     )
-    start_epoch, start_batch = divmod(
-        start_step, batch_sampler.batches_per_epoch
-    )
+    if resume_payload is not None and int(resume_payload["version"]) == 2:
+        start_epoch, start_batch = divmod(
+            start_step, batch_sampler.batches_per_epoch
+        )
     stream = DistributedEpochIterator(
         loader,
         batch_sampler,
@@ -391,11 +444,13 @@ def run(args: argparse.Namespace) -> None:
     trainable_parameters = [parameter for parameter in model.parameters() if parameter.requires_grad]
     optimizer = torch.optim.AdamW(
         trainable_parameters,
-        lr=learning_rate_at_step(config.optimizer, 0),
+        lr=config.optimizer.learning_rate,
         betas=config.optimizer.betas,
     )
     if resume_payload is not None:
         optimizer.load_state_dict(resume_payload["optimizer"])
+        if int(resume_payload["version"]) == CHECKPOINT_VERSION:
+            restore_rng_state(resume_payload["rng_states"][rank], device)
     lpips_metric = create_lpips_vgg(device)
 
     manifest = {
@@ -427,7 +482,13 @@ def run(args: argparse.Namespace) -> None:
         "precision": "BF16 autocast with FP32 VQ assignment and losses",
         "world_size": world_size,
         "batch_size_per_gpu": config.train.batch_size,
-        "global_batch_size": config.train.batch_size * world_size,
+        "global_batch_size": global_batch_size,
+        "data_loader": {
+            "implementation": "opencv_worker_resize_crop",
+            "workers_per_rank": FAST_WORKERS_PER_RANK,
+            "prefetch_factor": FAST_PREFETCH_FACTOR,
+            "persistent_workers": True,
+        },
         "config": config_payload,
     }
     if rank == 0:
@@ -440,11 +501,11 @@ def run(args: argparse.Namespace) -> None:
 
     metrics_path = output_dir / "train_metrics.jsonl"
     log_path = output_dir / "training.log"
-    progress = tqdm(
+    progress = IntervalProgress(
         total=config.train.max_steps,
         initial=start_step,
         desc=f"Stage1 {args.tokenizer} EMA-VQ",
-        dynamic_ncols=True,
+        interval=config.train.log_interval,
     ) if rank == 0 else None
 
     resume_evaluation_dir = (
@@ -452,7 +513,7 @@ def run(args: argparse.Namespace) -> None:
     )
     resume_evaluations_complete = all(
         (resume_evaluation_dir / f"{dataset}.json").exists()
-        for dataset, _ in BENCHMARKS_BY_RANK
+        for dataset in ("uvg", "mcl_jcv", "hevc_b")
     )
     if resume_payload is not None and not resume_evaluations_complete:
         del ddp_model
@@ -465,6 +526,7 @@ def run(args: argparse.Namespace) -> None:
             lpips_metric,
             rank=rank,
             local_rank=local_rank,
+            world_size=world_size,
             device=device,
         )
 
@@ -474,7 +536,9 @@ def run(args: argparse.Namespace) -> None:
         synchronize(device)
         started = time.perf_counter()
         video = stream.next().to(device, non_blocking=True)
-        learning_rate = learning_rate_at_step(config.optimizer, step)
+        learning_rate = learning_rate_at_step(
+            config.optimizer, config.train.max_steps, step
+        )
         optimizer.param_groups[0]["lr"] = learning_rate
         optimizer.zero_grad(set_to_none=True)
 
@@ -576,19 +640,22 @@ def run(args: argparse.Namespace) -> None:
             checkpoint_path = (
                 output_dir / "checkpoints" / f".candidate_step_{step:07d}.pt"
             )
-            if rank == 0:
-                save_checkpoint(
-                    checkpoint_path,
-                    model,
-                    optimizer,
-                    args.tokenizer,
-                    spec.input_frames,
-                    spec.latent_channels,
-                    spec.codebook_dim,
-                    config_payload,
-                    step,
-                )
-            dist.barrier()
+            save_checkpoint(
+                checkpoint_path,
+                model,
+                optimizer,
+                args.tokenizer,
+                spec.input_frames,
+                spec.latent_channels,
+                spec.codebook_dim,
+                config_payload,
+                step=step,
+                stream=stream,
+                world_size=world_size,
+                global_batch_size=global_batch_size,
+                rank=rank,
+                device=device,
+            )
             optimizer.zero_grad(set_to_none=True)
             del output, video, lpips_loss, mse_loss, total_loss
             del mse, psnr, values, histogram, probabilities, active, perplexity
@@ -602,6 +669,7 @@ def run(args: argparse.Namespace) -> None:
                 lpips_metric,
                 rank=rank,
                 local_rank=local_rank,
+                world_size=world_size,
                 device=device,
             )
             if rank == 0:

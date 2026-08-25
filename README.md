@@ -24,17 +24,17 @@ benchmarks under `outputs/benchmarks/` are the only versioned output artifacts.
 
 The current train-eval pipeline has one entry per stage:
 
-| Stage | Cosine entry | Integrated behavior |
+| Stage | Canonical entry | Integrated behavior |
 | --- | --- | --- |
-| 1 | `scripts/stage1_cosine.py` | cosine LR, high-throughput loader, video-distributed Gaussian eval |
-| 2 | `scripts/stage2_cosine.py` | cosine LR, high-throughput loader, video-distributed Gaussian eval |
-| 3 | `scripts/stage3_cosine.py` | cosine LR, high-throughput loader, video-distributed Gaussian eval, direct `--resume` |
+| 1 | `scripts/stage1.py` | cosine LR, high-throughput loader, bad-video replacement, distributed eval, resume |
+| 2 | `scripts/stage2.py` | cosine LR, batch size 2/GPU, high-throughput loader, distributed eval, resume |
+| 3 | `scripts/stage3.py` | configurable λ, no discriminator, high-throughput loader, distributed eval, resume |
 
-These entries use the canonical `configs/stage*_cosine.yaml` files. GPU count is
+These entries use the canonical `configs/stage1.yaml`, `configs/stage2.yaml`,
+and `configs/stage3.yaml` files. GPU count is
 selected at launch through `torchrun --nproc_per_node`; it is not fixed by the
 repository. A checkpoint must resume with the same `world_size` and global
-batch size. The original `scripts/stage1.py`, `scripts/stage2.py`, and
-`scripts/stage3.py` entries remain as baseline references.
+batch size. Superseded primary training wrappers are not retained.
 
 The complete checkpoint, distributed eval, resume, metric, and reconstruction
 contract is fixed in [docs/train_eval_workflow.md](docs/train_eval_workflow.md).
@@ -67,9 +67,15 @@ loss = 1.0 × MSE + 1.0 × LPIPS-VGG + 0.25 × commitment
 ```
 
 ```bash
-torchrun --standalone --nproc_per_node=<gpu_count> scripts/stage1_cosine.py \
+torchrun --standalone --nproc_per_node=<gpu_count> scripts/stage1.py \
   --tokenizer minimax_h3 \
-  -c configs/stage1_cosine.yaml \
+  -c configs/stage1.yaml \
+  --dataset-root /ddn/team/shared/gemini \
+  --metadata /zjc/ARCodec/data/trainable_jsons_v1_filtered_decode_failures_step0 \
+  --uvg-root /luojx/data/UVG \
+  --mcl-jcv-root /luojx/data/MCL-JCV/figure4_bt709_first96 \
+  --hevc-b-root /luojx/data/HEVC-B/figure4_bt709_first96 \
+  --minimax-h3-model-dir /data/heli/model/MiniMax-H3/FL2VA/video_vae \
   --output-dir outputs/stage1_h3
 ```
 
@@ -89,8 +95,14 @@ loss = total negative log₂ probability / number of indices
 ```
 
 ```bash
-torchrun --standalone --nproc_per_node=<gpu_count> scripts/stage2_cosine.py \
-  -c configs/stage2_cosine.yaml \
+torchrun --standalone --nproc_per_node=<gpu_count> scripts/stage2.py \
+  -c configs/stage2.yaml \
+  --dataset-root /ddn/team/shared/gemini \
+  --metadata /zjc/ARCodec/data/trainable_jsons_v1_filtered_decode_failures_step0 \
+  --uvg-root /luojx/data/UVG \
+  --mcl-jcv-root /luojx/data/MCL-JCV/figure4_bt709_first96 \
+  --hevc-b-root /luojx/data/HEVC-B/figure4_bt709_first96 \
+  --minimax-h3-model-dir /data/heli/model/MiniMax-H3/FL2VA/video_vae \
   --tokenizer-checkpoint outputs/stage1_h3/checkpoints/checkpoint_best.pt \
   --output-dir outputs/stage2_h3
 ```
@@ -110,15 +122,21 @@ loss = 1.0 × MSE
      + 1.0 × LPIPS-VGG
      + 0.25 × commitment
      + λ × soft_bpp
-     + gan_weight × GAN loss
 ```
 
-The current λ=18 config uses cosine schedules for tokenizer and entropy-model
-learning rates. `gan_weight=0`, so GAN training is disabled.
+λ is read from `loss.rate_weight`; use one explicit config per RD point. The
+canonical Stage3 config has no GAN fields and the training path never builds
+or updates a discriminator.
 
 ```bash
-torchrun --standalone --nproc_per_node=<gpu_count> scripts/stage3_cosine.py \
-  -c configs/stage3_lambda18_cosine.yaml \
+torchrun --standalone --nproc_per_node=<gpu_count> scripts/stage3.py \
+  -c configs/stage3.yaml \
+  --dataset-root /ddn/team/shared/gemini \
+  --metadata /zjc/ARCodec/data/trainable_jsons_v1_filtered_decode_failures_step0 \
+  --uvg-root /luojx/data/UVG \
+  --mcl-jcv-root /luojx/data/MCL-JCV/figure4_bt709_first96 \
+  --hevc-b-root /luojx/data/HEVC-B/figure4_bt709_first96 \
+  --minimax-h3-model-dir /data/heli/model/MiniMax-H3/FL2VA/video_vae \
   --tokenizer-checkpoint outputs/stage1_h3/checkpoints/checkpoint_best.pt \
   --entropy-checkpoint outputs/stage2_h3/checkpoints/checkpoint_best.pt \
   --output-dir outputs/stage3_h3

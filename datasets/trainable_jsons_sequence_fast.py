@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import json
 import math
+import os
 from pathlib import Path, PurePosixPath
 
 import cv2
 import numpy as np
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, get_worker_info
 
 from .openvid_mp4_sequence import TrainingSampleKey
 
@@ -15,6 +16,11 @@ from .openvid_mp4_sequence import TrainingSampleKey
 JSON_MOUNT_ROOT = PurePosixPath("/workspace/gemini")
 RESIZE_SHORT_SIDE = 512
 CROP_SIZE = 256
+MAX_DECODE_ATTEMPTS = 16
+
+
+class VideoDecodeError(RuntimeError):
+    pass
 
 
 def load_mp4_window_resize_crop(
@@ -38,23 +44,23 @@ def load_mp4_window_resize_crop(
 
     capture = cv2.VideoCapture(str(video_path))
     if not capture.isOpened():
-        raise RuntimeError(f"OpenCV could not open {video_path}")
+        raise VideoDecodeError(f"OpenCV could not open {video_path}")
     frames: list[np.ndarray] = []
     try:
         if not capture.set(cv2.CAP_PROP_POS_FRAMES, float(start_frame)):
-            raise RuntimeError(
+            raise VideoDecodeError(
                 f"OpenCV could not seek {video_path} to frame {start_frame}"
             )
         actual_position = capture.get(cv2.CAP_PROP_POS_FRAMES)
         if abs(actual_position - start_frame) > 0.5:
-            raise RuntimeError(
+            raise VideoDecodeError(
                 f"OpenCV seek mismatch for {video_path}: "
                 f"requested={start_frame}, actual={actual_position}"
             )
         for offset in range(num_frames):
             ok, bgr = capture.read()
             if not ok or bgr is None:
-                raise RuntimeError(
+                raise VideoDecodeError(
                     f"OpenCV stopped at source frame {start_frame + offset}: "
                     f"{video_path}"
                 )
@@ -86,10 +92,12 @@ class SeededFastTrainableJsonsVideoDataset(Dataset[torch.Tensor]):
         metadata_path: str | Path,
         *,
         num_frames: int = 25,
+        rejection_log: str | Path | None = None,
     ) -> None:
         self.dataset_root = Path(dataset_root)
         self.metadata_path = Path(metadata_path)
         self.num_frames = num_frames
+        self.rejection_log = None if rejection_log is None else Path(rejection_log)
         if num_frames <= 0:
             raise ValueError(f"Sequence length must be positive, got {num_frames}")
         if not self.dataset_root.is_dir():
@@ -142,13 +150,70 @@ class SeededFastTrainableJsonsVideoDataset(Dataset[torch.Tensor]):
             raise ValueError(f"crop_seed must be non-negative, got {key.crop_seed}")
 
         generator = torch.Generator().manual_seed(key.crop_seed)
-        max_start = self.video_lengths[key.index] - self.num_frames
-        start_frame = int(torch.randint(max_start + 1, (), generator=generator))
-        video = load_mp4_window_resize_crop(
-            self.video_paths[key.index],
-            start_frame,
-            self.num_frames,
-            self.frame_sizes[key.index],
-            generator,
-        )
-        return video.float().div_(127.5).sub_(1.0).permute(1, 0, 2, 3)
+        candidate_index = key.index
+        rejected_indices: set[int] = set()
+        for attempt in range(1, MAX_DECODE_ATTEMPTS + 1):
+            max_start = self.video_lengths[candidate_index] - self.num_frames
+            start_frame = int(torch.randint(max_start + 1, (), generator=generator))
+            try:
+                video = load_mp4_window_resize_crop(
+                    self.video_paths[candidate_index],
+                    start_frame,
+                    self.num_frames,
+                    self.frame_sizes[candidate_index],
+                    generator,
+                )
+            except VideoDecodeError as error:
+                if self.rejection_log is None:
+                    raise
+                rejected_indices.add(candidate_index)
+                replacement_index = None
+                if attempt < MAX_DECODE_ATTEMPTS and len(rejected_indices) < len(self):
+                    replacement_rank = int(
+                        torch.randint(
+                            len(self) - len(rejected_indices),
+                            (),
+                            generator=generator,
+                        )
+                    )
+                    replacement_index = replacement_rank
+                    for rejected_index in sorted(rejected_indices):
+                        if replacement_index >= rejected_index:
+                            replacement_index += 1
+
+                worker = get_worker_info()
+                record = {
+                    "event": "rejected_training_sample",
+                    "rank": int(os.environ["RANK"]),
+                    "worker": worker.id if worker is not None else 0,
+                    "requested_index": key.index,
+                    "rejected_index": candidate_index,
+                    "replacement_index": replacement_index,
+                    "attempt": attempt,
+                    "crop_seed": key.crop_seed,
+                    "start_frame": start_frame,
+                    "video_path": str(self.video_paths[candidate_index]),
+                    "error": str(error),
+                }
+                line = (json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n").encode()
+                descriptor = os.open(
+                    self.rejection_log,
+                    os.O_WRONLY | os.O_CREAT | os.O_APPEND,
+                    0o644,
+                )
+                try:
+                    os.write(descriptor, line)
+                finally:
+                    os.close(descriptor)
+
+                if replacement_index is None:
+                    raise RuntimeError(
+                        f"Failed to decode {attempt} deterministic candidates for "
+                        f"requested dataset index {key.index}"
+                    ) from error
+                candidate_index = replacement_index
+                continue
+
+            return video.float().div_(127.5).sub_(1.0).permute(1, 0, 2, 3)
+
+        raise AssertionError("unreachable")

@@ -4,8 +4,8 @@ from pathlib import Path
 import pytest
 import torch
 
-from scripts.stage2_cosine import scheduler_scale as stage2_scheduler_scale
-from scripts.stage3_cosine import scheduler_scale as stage3_scheduler_scale
+from scripts.stage2 import scheduler_scale as stage2_scheduler_scale
+from scripts.stage3 import scheduler_scale as stage3_scheduler_scale
 from training.config_stage1_cosine import (
     learning_rate_at_step as stage1_learning_rate,
     load_stage1_training_config,
@@ -24,9 +24,9 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def test_cosine_configs_have_exact_endpoints_and_decrease() -> None:
-    stage1 = load_stage1_training_config(ROOT / "configs/stage1_cosine.yaml")
-    stage2 = load_stage2_config(ROOT / "configs/stage2_cosine.yaml")
-    stage3 = load_stage3_config(ROOT / "configs/stage3_cosine.yaml")
+    stage1 = load_stage1_training_config(ROOT / "configs/stage1.yaml")
+    stage2 = load_stage2_config(ROOT / "configs/stage2.yaml")
+    stage3 = load_stage3_config(ROOT / "configs/stage3.yaml")
 
     stage1_rates = [
         stage1_learning_rate(stage1.optimizer, stage1.train.max_steps, step)
@@ -64,8 +64,8 @@ def test_cosine_configs_have_exact_endpoints_and_decrease() -> None:
 
 
 def test_lambda_lr_scales_match_cosine_step_definition() -> None:
-    stage2 = load_stage2_config(ROOT / "configs/stage2_cosine.yaml")
-    stage3 = load_stage3_config(ROOT / "configs/stage3_cosine.yaml")
+    stage2 = load_stage2_config(ROOT / "configs/stage2.yaml")
+    stage3 = load_stage3_config(ROOT / "configs/stage3.yaml")
 
     assert stage2_scheduler_scale(stage2, 0) == pytest.approx(1.0)
     assert stage2_scheduler_scale(stage2, stage2.train.max_steps - 1) == pytest.approx(
@@ -88,7 +88,7 @@ def test_lambda_lr_scales_match_cosine_step_definition() -> None:
 
 
 def test_stage2_scheduler_resume_preserves_next_step_learning_rate() -> None:
-    config = load_stage2_config(ROOT / "configs/stage2_cosine.yaml")
+    config = load_stage2_config(ROOT / "configs/stage2.yaml")
     parameter = torch.nn.Parameter(torch.tensor(0.0))
     optimizer = torch.optim.AdamW(
         [parameter], lr=config.optimizer.learning_rate
@@ -141,11 +141,12 @@ def test_stage2_scheduler_resume_preserves_next_step_learning_rate() -> None:
 
 
 def test_cosine_configs_preserve_stage_policies() -> None:
-    stage1 = load_stage1_training_config(ROOT / "configs/stage1_cosine.yaml")
-    stage2 = load_stage2_config(ROOT / "configs/stage2_cosine.yaml")
-    stage3 = load_stage3_config(ROOT / "configs/stage3_cosine.yaml")
+    stage1 = load_stage1_training_config(ROOT / "configs/stage1.yaml")
+    stage2 = load_stage2_config(ROOT / "configs/stage2.yaml")
+    stage3 = load_stage3_config(ROOT / "configs/stage3.yaml")
 
     assert stage1.train.checkpoint_policy == "best_lpips"
     assert stage2.train.checkpoint_policy == "best_bpp"
+    assert stage2.train.batch_size == 2
     assert stage3.loss.rate_weight == 24.0
-    assert stage3.loss.gan_weight == 0.0
+    assert not hasattr(stage3.loss, "gan_weight")

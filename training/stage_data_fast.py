@@ -24,12 +24,14 @@ def build_stage_dataset_fast(
     num_frames: int,
     output_dir: str | Path,
 ):
-    del output_dir
     if dataset_format != "trainable_jsons":
         raise ValueError(
             "Fast loader supports only dataset_format='trainable_jsons', "
             f"got {dataset_format!r}"
         )
     return SeededFastTrainableJsonsVideoDataset(
-        dataset_root, metadata, num_frames=num_frames
+        dataset_root,
+        metadata,
+        num_frames=num_frames,
+        rejection_log=Path(output_dir) / "rejected_samples.jsonl",
     )

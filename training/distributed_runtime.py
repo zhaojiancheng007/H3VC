@@ -17,6 +17,28 @@ from datasets.openvid_mp4_sequence import TrainingSampleKey
 DATALOADER_PREFETCH_FACTOR = 2
 
 
+class IntervalProgress:
+    def __init__(self, *, total: int, initial: int, desc: str, interval: int) -> None:
+        if interval <= 0:
+            raise ValueError(f"Progress interval must be positive, got {interval}")
+        self.total = total
+        self.n = initial
+        self.desc = desc
+        self.interval = interval
+
+    def update(self, count: int = 1) -> None:
+        self.n += count
+
+    def set_postfix(self, **metrics: object) -> None:
+        if self.n % self.interval != 0:
+            return
+        values = " ".join(f"{name}={value}" for name, value in metrics.items())
+        print(f"{self.desc}: {self.n}/{self.total} {values}", flush=True)
+
+    def close(self) -> None:
+        pass
+
+
 class ResumableDistributedBatchSampler(BatchSampler):
     def __init__(
         self,

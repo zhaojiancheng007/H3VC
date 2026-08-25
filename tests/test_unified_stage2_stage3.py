@@ -15,9 +15,12 @@ from scripts.stage2 import (
 from scripts.stage3 import load_stage2_checkpoint, rate_parameters
 from tokenizer.stage3_vq import relaxed_quantize
 from training import evaluation_categorical
-from training.config_stage2 import learning_rate_at_step, load_stage2_config
-from training.config_stage3 import learning_rates_at_step, load_stage3_config
-from training.periodic_benchmarks import benchmark_for_rank, evaluation_command
+from training.config_stage2_cosine import learning_rate_at_step, load_stage2_config
+from training.config_stage3_cosine import (
+    cosine_learning_rates_at_step,
+    load_stage3_config,
+)
+from training.periodic_benchmarks_gaussian import distributed_evaluation_command
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -85,57 +88,50 @@ def test_canonical_configs_use_4096x24_without_gradient_accumulation() -> None:
     assert stage2.model.codebook_dim == stage3.model.codebook_dim == 24
     assert not hasattr(stage2.train, "gradient_accumulation")
     assert not hasattr(stage3.train, "gradient_accumulation")
-    assert stage3.loss.gan_start_step == 20000
-    assert stage3.loss.gan_weight == 0.0
+    assert stage2.train.batch_size == 2
+    assert not hasattr(stage3.loss, "gan_weight")
 
 
-def test_h3_stage2_multistep_schedule_and_best_policy() -> None:
+def test_h3_stage2_cosine_schedule_and_best_policy() -> None:
     config = load_stage2_config(ROOT / "configs/stage2.yaml")
 
     assert config.train.max_steps == 60_000
     assert config.train.checkpoint_interval == 5_000
     assert config.train.checkpoint_policy == "best_bpp"
-    expected = (
-        (0, 5e-5),
-        (14_999, 5e-5),
-        (15_000, 1e-5),
-        (29_999, 1e-5),
-        (30_000, 5e-6),
-        (44_999, 5e-6),
-        (45_000, 1e-6),
-        (60_000, 1e-6),
+    first = learning_rate_at_step(config.optimizer, config.train.max_steps, 1)
+    middle = learning_rate_at_step(config.optimizer, config.train.max_steps, 30_000)
+    last = learning_rate_at_step(config.optimizer, config.train.max_steps, 60_000)
+    assert first == config.optimizer.learning_rate
+    assert first > middle > last
+    assert last == config.optimizer.eta_min
+    assert scheduler_scale(config, 0) == pytest.approx(1.0)
+    assert scheduler_scale(config, 59_999) == pytest.approx(
+        config.optimizer.eta_min / config.optimizer.learning_rate
     )
-    for step, rate in expected:
-        assert learning_rate_at_step(config.optimizer, step) == rate
-    assert scheduler_scale(config, 14_999) == pytest.approx(0.2)
-    assert scheduler_scale(config, 29_999) == pytest.approx(0.1)
-    assert scheduler_scale(config, 44_999) == pytest.approx(0.02)
 
 
-def test_h3_stage3_uses_fixed_rate_and_multistep_learning_rates() -> None:
+def test_h3_stage3_uses_configurable_rate_and_cosine_learning_rates() -> None:
     config = load_stage3_config(ROOT / "configs/stage3.yaml")
 
     assert config.train.max_steps == 60_000
     assert config.train.checkpoint_interval == 5_000
     assert config.train.bf16
     configured_rate = (config.loss.rate_weight, config.loss.temperature)
-    for step in (0, 15_000, 30_000, 45_000, 60_000):
+    for step in (1, 15_000, 30_000, 45_000, 60_000):
         assert rate_parameters(step, config) == configured_rate
-    expected = (
-        (0, 1e-5, 5e-5),
-        (14_999, 1e-5, 5e-5),
-        (15_000, 5e-6, 1e-5),
-        (29_999, 5e-6, 1e-5),
-        (30_000, 1e-6, 5e-6),
-        (44_999, 1e-6, 5e-6),
-        (45_000, 5e-7, 1e-6),
-        (60_000, 5e-7, 1e-6),
+    first = cosine_learning_rates_at_step(config, 1)
+    middle = cosine_learning_rates_at_step(config, 30_000)
+    last = cosine_learning_rates_at_step(config, 60_000)
+    assert first == (
+        config.optimizer.tokenizer_learning_rate,
+        config.optimizer.entropy_learning_rate,
     )
-    for step, tokenizer_rate, entropy_rate in expected:
-        assert learning_rates_at_step(config.optimizer, step) == (
-            tokenizer_rate,
-            entropy_rate,
-        )
+    assert first[0] > middle[0] > last[0]
+    assert first[1] > middle[1] > last[1]
+    assert last == (
+        config.optimizer.tokenizer_eta_min,
+        config.optimizer.entropy_eta_min,
+    )
 
 
 def test_stage3_accepts_version_2_stage2_checkpoint(tmp_path: Path) -> None:
@@ -298,7 +294,7 @@ def test_h3_uvg_rate_uses_one_path_for_raw_and_entropy_bits(monkeypatch) -> None
     assert hevc_report["dataset"] == "HEVC-B"
 
 
-def test_periodic_benchmarks_map_ranks_to_three_datasets(tmp_path: Path) -> None:
+def test_periodic_benchmarks_use_rank_shards(tmp_path: Path) -> None:
     args = Namespace(
         config=str(ROOT / "configs/stage2.yaml"),
         uvg_root="/shared/uvg",
@@ -315,19 +311,16 @@ def test_periodic_benchmarks_map_ranks_to_three_datasets(tmp_path: Path) -> None
     )
     evaluation_dir = tmp_path / "evaluations" / "step_0005000"
 
-    assignments = [
-        benchmark_for_rank(args, rank, evaluation_dir) for rank in range(4)
-    ]
-
-    assert assignments == [
-        ("uvg", Path("/shared/uvg"), evaluation_dir / "uvg.json"),
-        ("mcl_jcv", Path("/shared/mcl_jcv"), evaluation_dir / "mcl_jcv.json"),
-        ("hevc_b", Path("/shared/hevc_b"), evaluation_dir / "hevc_b.json"),
-        None,
-    ]
-    command = evaluation_command(
-        args, 2, tmp_path / "checkpoint.pt", *assignments[1], ROOT
+    command = distributed_evaluation_command(
+        args,
+        2,
+        tmp_path / "checkpoint.pt",
+        evaluation_dir,
+        1,
+        4,
+        ROOT,
     )
-    assert command[1].endswith("scripts/evaluate_stage2_entropy_uvg.py")
-    assert command[command.index("--dataset") + 1] == "mcl_jcv"
-    assert command[command.index("--output") + 1].endswith("mcl_jcv.json")
+    assert command[1].endswith("scripts/evaluate_stage2_cosine_gaussian_distributed.py")
+    assert command[command.index("--rank") + 1] == "1"
+    assert command[command.index("--world-size") + 1] == "4"
+    assert command[command.index("--output") + 1].endswith("shards/rank_01.json")

@@ -18,7 +18,6 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data.distributed import DistributedSampler
-from tqdm import tqdm
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -29,45 +28,46 @@ from metrics.reporting import write_json
 from tokenizer.stage3_vq import JointVQModel
 from tokenizer.stage_checkpoint import load_stage1_tokenizer
 from training.training_state import DDPTrainingState
-from training.config_stage3 import (
+from training.config_stage3_cosine import (
     Stage3Config,
-    learning_rates_at_step,
+    cosine_learning_rates_at_step,
     load_stage3_config,
     stage3_config_dict,
 )
-from training.stage_data import (
+from training.stage_data_fast import (
     DEFAULT_DATASET_FORMAT,
-    DEFAULT_DATASET_ROOT,
-    DEFAULT_METADATA,
-    build_stage_dataset,
+    build_stage_dataset_fast as build_stage_dataset,
 )
+from training.checkpoint_config_fast import assert_fast_loader_resume_config
+from training.checkpoint_paths import assert_checkpoint_reference
 from training.distributed_runtime import (
     DistributedEpochIterator,
+    IntervalProgress,
     ResumableDistributedBatchSampler,
     all_reduce_mean,
     append_log,
-    build_video_dataloader,
     capture_rng_state,
     collective_error,
     rank_zero_output_setup,
     restore_rng_state,
 )
-from training.gan_stage3 import (
-    PatchDiscriminator,
-    discriminator_microbatch_backward,
-    generator_adversarial_loss,
-    select_gan_frames,
+from training.distributed_runtime_fast import (
+    FAST_PREFETCH_FACTOR,
+    FAST_WORKERS_PER_RANK,
+    build_video_dataloader_fast as build_video_dataloader,
 )
-from training.periodic_benchmarks import (
-    BENCHMARKS_BY_RANK,
-    benchmark_for_rank,
-    evaluation_command,
-    evaluation_environment,
+from training.evaluation_categorical_distributed import (
+    merge_evaluation_shards,
+    replace_reconstruction_archive,
+)
+from training.periodic_benchmarks import evaluation_environment
+from training.periodic_benchmarks_gaussian import (
+    distributed_evaluation_command as evaluation_command,
 )
 from training.video_losses import chunked_video_lpips, create_lpips_vgg
 
 
-CHECKPOINT_VERSION = 2
+CHECKPOINT_VERSION = 3
 LPIPS_FRAME_BATCH_SIZE = 16
 
 
@@ -76,26 +76,28 @@ def parse_args() -> argparse.Namespace:
         description="Jointly train a Stage1 VQ tokenizer and Stage2 entropy model"
     )
     parser.add_argument(
-        "-c", "--config", default=str(PROJECT_ROOT / "configs/stage3.yaml")
+        "-c",
+        "--config",
+        default=str(PROJECT_ROOT / "configs/stage3.yaml"),
     )
-    parser.add_argument("--dataset-root", default=DEFAULT_DATASET_ROOT)
-    parser.add_argument("--metadata", default=DEFAULT_METADATA)
+    parser.add_argument("--dataset-root", required=True)
+    parser.add_argument("--metadata", required=True)
     parser.add_argument(
         "--dataset-format",
         default=DEFAULT_DATASET_FORMAT,
-        choices=("openvid", "trainable_jsons"),
+        choices=("trainable_jsons",),
     )
     parser.add_argument("--tokenizer-checkpoint", required=True)
     parser.add_argument("--entropy-checkpoint", required=True)
     parser.add_argument("--output-dir", required=True)
-    parser.add_argument("--uvg-root", default="/luojix/data/UVG")
+    parser.add_argument("--uvg-root", required=True)
     parser.add_argument(
         "--mcl-jcv-root",
-        default="/luojix/data/MCL-JCV/figure4_bt709_first96",
+        required=True,
     )
     parser.add_argument(
         "--hevc-b-root",
-        default="/luojix/data/HEVC-B/figure4_bt709_first96",
+        required=True,
     )
     parser.add_argument("--wan-repo", default=str(PROJECT_ROOT / "Wan2.1"))
     parser.add_argument(
@@ -112,6 +114,12 @@ def parse_args() -> argparse.Namespace:
         default=str(PROJECT_ROOT / "pretrained_ckpts/Cosmos-0.1-Tokenizer-CV4x8x8/decoder.jit"),
     )
     parser.add_argument("--resume")
+    parser.add_argument("--init-checkpoint")
+    parser.add_argument(
+        "--allow-checkpoint-relocation",
+        action="store_true",
+        help="Accept explicitly supplied source checkpoints as relocated exact copies",
+    )
     parser.add_argument(
         "--cosmos-cv888-encoder",
         default=str(PROJECT_ROOT / "pretrained_ckpts/Cosmos-0.1-Tokenizer-CV8x8x8/encoder.jit"),
@@ -122,7 +130,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--minimax-h3-model-dir",
-        default=str(PROJECT_ROOT / "pretrained_ckpts/MiniMax-H3/FL2VA/video_vae"),
+        required=True,
     )
     parser.add_argument("--stop-after-steps", type=int)
     return parser.parse_args()
@@ -164,7 +172,7 @@ def load_stage2_checkpoint(path: str | Path) -> dict:
 
 def load_stage3_checkpoint(path: str | Path) -> dict:
     payload = torch.load(path, map_location="cpu", weights_only=False)
-    required = {
+    common = {
         "version",
         "stage",
         "step",
@@ -174,18 +182,22 @@ def load_stage3_checkpoint(path: str | Path) -> dict:
         "config",
         "model",
         "optimizer",
-        "discriminator",
-        "discriminator_optimizer",
         "training_state",
         "rng_states",
     }
+    version = int(payload.get("version", -1))
+    required = (
+        common | {"discriminator", "discriminator_optimizer"}
+        if version == 2
+        else common
+    )
     if set(payload) != required:
         raise ValueError(
             f"Stage3 checkpoint fields are {sorted(payload)}, "
             f"expected {sorted(required)}"
         )
-    if payload["version"] != CHECKPOINT_VERSION or payload["stage"] != 3:
-        raise ValueError("Expected a version-2 Stage3 checkpoint")
+    if version not in (2, CHECKPOINT_VERSION) or payload["stage"] != 3:
+        raise ValueError("Expected a version-2 or version-3 Stage3 checkpoint")
     return payload
 
 
@@ -204,65 +216,62 @@ def evaluate_checkpoint_in_subprocess(
     evaluation_dir: Path,
     model: JointVQModel,
     optimizer: torch.optim.Optimizer,
-    discriminator: PatchDiscriminator,
-    discriminator_optimizer: torch.optim.Optimizer,
     lpips_metric: torch.nn.Module,
     *,
     rank: int,
     local_rank: int,
+    world_size: int,
     device: torch.device,
-) -> tuple[DistributedDataParallel, DistributedDataParallel]:
+) -> DistributedDataParallel:
+    cpu = torch.device("cpu")
+    model.to(cpu)
+    move_optimizer_state(optimizer, cpu)
+    lpips_metric.to(cpu)
     gc.collect()
     torch.cuda.empty_cache()
     dist.barrier()
 
-    benchmark = benchmark_for_rank(args, rank, evaluation_dir)
-    if benchmark is not None:
-        dataset, dataset_root, output_path = benchmark
-        model.to("cpu")
-        discriminator.to("cpu")
-        move_optimizer_state(optimizer, torch.device("cpu"))
-        move_optimizer_state(discriminator_optimizer, torch.device("cpu"))
-        lpips_metric.to("cpu")
-        gc.collect()
-        torch.cuda.empty_cache()
-        subprocess.run(
-            evaluation_command(
-                args, 3, checkpoint_path, dataset, dataset_root, output_path, PROJECT_ROOT
-            ),
-            cwd=PROJECT_ROOT,
-            env=evaluation_environment(local_rank),
-            check=True,
-        )
-        model.to(device)
-        discriminator.to(device)
-        move_optimizer_state(optimizer, device)
-        move_optimizer_state(discriminator_optimizer, device)
-        lpips_metric.to(device)
-        torch.cuda.empty_cache()
-
+    subprocess.run(
+        evaluation_command(
+            args, 3, checkpoint_path, evaluation_dir, rank, world_size, PROJECT_ROOT
+        ),
+        cwd=PROJECT_ROOT,
+        env=evaluation_environment(local_rank),
+        check=True,
+    )
     dist.barrier()
+    if rank == 0:
+        shards = []
+        for shard_rank in range(world_size):
+            shard_path = evaluation_dir / "shards" / f"rank_{shard_rank:02d}.json"
+            with shard_path.open("r", encoding="utf-8") as handle:
+                shards.append(json.load(handle))
+        evaluations = merge_evaluation_shards(shards)
+        for dataset, evaluation in evaluations.items():
+            evaluation["protocol"]["reconstruction"] = f"../recon/{dataset}"
+            write_json(evaluation_dir / f"{dataset}.json", evaluation)
+        replace_reconstruction_archive(
+            evaluation_dir / "recon", evaluation_dir.parent / "recon"
+        )
+    dist.barrier()
+
+    model.to(device)
+    move_optimizer_state(optimizer, device)
+    lpips_metric.to(device)
+    torch.cuda.empty_cache()
     ddp_model = DistributedDataParallel(
         model,
         device_ids=[local_rank],
         broadcast_buffers=False,
         find_unused_parameters=False,
     )
-    ddp_discriminator = DistributedDataParallel(
-        discriminator,
-        device_ids=[local_rank],
-        broadcast_buffers=True,
-        find_unused_parameters=False,
-    )
-    return ddp_model, ddp_discriminator
+    return ddp_model
 
 
 def save_checkpoint(
     path: Path,
     model: JointVQModel,
     optimizer: torch.optim.Optimizer,
-    discriminator: PatchDiscriminator,
-    discriminator_optimizer: torch.optim.Optimizer,
     config: Stage3Config,
     tokenizer_name: str,
     tokenizer_checkpoint: Path,
@@ -300,8 +309,6 @@ def save_checkpoint(
             "config": stage3_config_dict(config),
             "model": model.state_dict(),
             "optimizer": optimizer.state_dict(),
-            "discriminator": discriminator.state_dict(),
-            "discriminator_optimizer": discriminator_optimizer.state_dict(),
             "training_state": asdict(state),
             "rng_states": rng_states,
         }
@@ -312,12 +319,20 @@ def save_checkpoint(
     dist.barrier()
 
 
+def scheduler_scale(config: Stage3Config, scheduler_step: int, group: int) -> float:
+    schedule_step = min(scheduler_step + 1, config.train.max_steps)
+    learning_rates = cosine_learning_rates_at_step(config, schedule_step)
+    initial_rates = (
+        config.optimizer.tokenizer_learning_rate,
+        config.optimizer.entropy_learning_rate,
+    )
+    return learning_rates[group] / initial_rates[group]
+
+
 def run(args: argparse.Namespace) -> None:
     rank = int(os.environ["RANK"])
     local_rank = int(os.environ["LOCAL_RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
-    if world_size < len(BENCHMARKS_BY_RANK):
-        raise ValueError("Periodic evaluation requires at least 3 distributed ranks")
     torch.cuda.set_device(local_rank)
     device = torch.device("cuda", local_rank)
     config = load_stage3_config(args.config)
@@ -368,39 +383,77 @@ def run(args: argparse.Namespace) -> None:
         dataset, batch_sampler, generator, num_workers=config.train.num_workers
     )
 
-    entropy_checkpoint = Path(args.entropy_checkpoint).resolve()
+    entropy_checkpoint = Path(args.entropy_checkpoint).resolve(strict=True)
     stage2 = load_stage2_checkpoint(entropy_checkpoint)
     if stage2["tokenizer"] != loaded.name:
         raise ValueError("Stage1 and Stage2 tokenizer types differ")
-    if Path(stage2["tokenizer_checkpoint"]) != loaded.checkpoint:
-        raise ValueError("Stage2 was trained with a different Stage1 checkpoint")
+    stage2_source_relocated = assert_checkpoint_reference(
+        stage2["tokenizer_checkpoint"],
+        loaded.checkpoint,
+        label="Stage2 source Stage1 checkpoint",
+        allow_relocation=args.allow_checkpoint_relocation,
+    )
     if stage2["config"]["model"] != asdict(config.model):
         raise ValueError("Stage2 and Stage3 entropy model configs differ")
 
     entropy_model = CategoricalEntropyModel(config.model)
     entropy_model.load_state_dict(stage2["model"], strict=True)
     model = JointVQModel(loaded.model, entropy_model)
-    discriminator = PatchDiscriminator(base_channels=64, num_layers=3)
+    initialization_relocated = False
+    initialization = (
+        None if args.init_checkpoint is None
+        else load_stage3_checkpoint(args.init_checkpoint)
+    )
+    if initialization is not None:
+        if initialization["tokenizer"] != loaded.name:
+            raise ValueError("Initialization and Stage1 tokenizer types differ")
+        initialization_relocated = assert_checkpoint_reference(
+            initialization["tokenizer_checkpoint"],
+            loaded.checkpoint,
+            label="Stage3 initialization Stage1 checkpoint",
+            allow_relocation=args.allow_checkpoint_relocation,
+        )
+        initialization_relocated |= assert_checkpoint_reference(
+            initialization["entropy_checkpoint"],
+            entropy_checkpoint,
+            label="Stage3 initialization Stage2 checkpoint",
+            allow_relocation=args.allow_checkpoint_relocation,
+        )
+        if initialization["config"]["model"] != asdict(config.model):
+            raise ValueError("Initialization and cosine Stage3 model configs differ")
+        model.load_state_dict(initialization["model"], strict=True)
     resume = None if args.resume is None else load_stage3_checkpoint(args.resume)
+    resume_relocated = False
     start_step = 0
     start_epoch = 0
     start_batch = 0
     if resume is not None:
-        if resume["config"] != config_payload:
-            raise ValueError("Stage3 resume config changed")
+        assert_fast_loader_resume_config(
+            resume["config"], config_payload, stage="Stage3"
+        )
         if resume["tokenizer"] != loaded.name:
             raise ValueError("Stage3 resume tokenizer changed")
+        resume_relocated = assert_checkpoint_reference(
+            resume["tokenizer_checkpoint"],
+            loaded.checkpoint,
+            label="Stage3 resume Stage1 checkpoint",
+            allow_relocation=args.allow_checkpoint_relocation,
+        )
+        resume_relocated |= assert_checkpoint_reference(
+            resume["entropy_checkpoint"],
+            entropy_checkpoint,
+            label="Stage3 resume Stage2 checkpoint",
+            allow_relocation=args.allow_checkpoint_relocation,
+        )
         state = DDPTrainingState(**resume["training_state"])
         if state.world_size != world_size or state.global_batch_size != global_batch_size:
             raise ValueError("Stage3 resume distributed batch changed")
         model.load_state_dict(resume["model"], strict=True)
-        discriminator.load_state_dict(resume["discriminator"], strict=True)
         start_step = state.step
         start_epoch = state.epoch
         start_batch = state.batch_in_epoch
 
     model = model.to(device)
-    discriminator = discriminator.to(device)
     tokenizer_parameters = [
         parameter for parameter in model.tokenizer.parameters() if parameter.requires_grad
     ]
@@ -409,34 +462,30 @@ def run(args: argparse.Namespace) -> None:
         [
             {
                 "params": tokenizer_parameters,
-                "lr": config.optimizer.tokenizer_learning_rate_schedule[0][1],
+                "lr": config.optimizer.tokenizer_learning_rate,
             },
             {
                 "params": entropy_parameters,
-                "lr": config.optimizer.entropy_learning_rate_schedule[0][1],
+                "lr": config.optimizer.entropy_learning_rate,
             },
         ],
         betas=config.optimizer.betas,
     )
-    discriminator_optimizer = torch.optim.Adam(
-        discriminator.parameters(),
-        lr=config.optimizer.discriminator_learning_rate,
-        betas=config.optimizer.betas,
-    )
     if resume is not None:
         optimizer.load_state_dict(resume["optimizer"])
-        discriminator_optimizer.load_state_dict(resume["discriminator_optimizer"])
+    scheduler = torch.optim.lr_scheduler.LambdaLR(
+        optimizer,
+        lr_lambda=[
+            lambda scheduler_step: scheduler_scale(config, scheduler_step, 0),
+            lambda scheduler_step: scheduler_scale(config, scheduler_step, 1),
+        ],
+        last_epoch=start_step - 1,
+    )
 
     ddp_model = DistributedDataParallel(
         model,
         device_ids=[local_rank],
         broadcast_buffers=False,
-        find_unused_parameters=False,
-    )
-    ddp_discriminator = DistributedDataParallel(
-        discriminator,
-        device_ids=[local_rank],
-        broadcast_buffers=True,
         find_unused_parameters=False,
     )
     output_dir = Path(args.output_dir)
@@ -478,37 +527,49 @@ def run(args: argparse.Namespace) -> None:
                 "batch_size_per_gpu": config.train.batch_size,
                 "global_batch_size": global_batch_size,
                 "precision": "BF16 autocast with FP32 parameters, VQ assignment, and losses",
+                "learning_rate_scheduler": "cosine_annealing",
+                "rate_weight": config.loss.rate_weight,
+                "temperature": config.loss.temperature,
+                "discriminator_training": "disabled",
+                "checkpoint_relocation_allowed": args.allow_checkpoint_relocation,
+                "checkpoint_relocated": (
+                    stage2_source_relocated
+                    or initialization_relocated
+                    or resume_relocated
+                ),
+                "data_loader": {
+                    "implementation": "opencv_worker_resize_crop",
+                    "workers_per_rank": FAST_WORKERS_PER_RANK,
+                    "prefetch_factor": FAST_PREFETCH_FACTOR,
+                    "persistent_workers": True,
+                },
+                "initialization_checkpoint": (
+                    None if args.init_checkpoint is None
+                    else str(Path(args.init_checkpoint).resolve())
+                ),
                 "config": config_payload,
             },
         )
     metrics_path = output_dir / "train_metrics.jsonl"
     log_path = output_dir / "training.log"
-    progress = tqdm(
+    progress = IntervalProgress(
         total=stop_step,
         initial=start_step,
         desc=f"Stage3 {loaded.name} joint",
-        dynamic_ncols=True,
+        interval=config.train.log_interval,
     ) if rank == 0 else None
     lpips_metric = create_lpips_vgg(device)
     trainable_parameters = [*tokenizer_parameters, *entropy_parameters]
     model.train()
-    discriminator.train()
 
     for step in range(start_step + 1, stop_step + 1):
         torch.cuda.synchronize(device)
         started = time.perf_counter()
         video = stream.next().to(device, non_blocking=True)
         rate_weight, temperature = rate_parameters(step, config)
-        tokenizer_learning_rate, entropy_learning_rate = learning_rates_at_step(
-            config.optimizer, step
-        )
-        optimizer.param_groups[0]["lr"] = tokenizer_learning_rate
-        optimizer.param_groups[1]["lr"] = entropy_learning_rate
-        gan_active = (
-            config.loss.gan_weight > 0 and step >= config.loss.gan_start_step
-        )
+        tokenizer_learning_rate = optimizer.param_groups[0]["lr"]
+        entropy_learning_rate = optimizer.param_groups[1]["lr"]
         optimizer.zero_grad(set_to_none=True)
-        discriminator_optimizer.zero_grad(set_to_none=True)
 
         with torch.autocast("cuda", dtype=torch.bfloat16, enabled=config.train.bf16):
             output = ddp_model(video, temperature=temperature)
@@ -519,14 +580,6 @@ def run(args: argparse.Namespace) -> None:
                 frame_batch_size=LPIPS_FRAME_BATCH_SIZE,
                 activation_checkpointing=True,
             )
-            generator_gan_loss = torch.zeros((), device=device)
-            if gan_active:
-                real_frames, fake_frames = select_gan_frames(
-                    video, output.tokenizer.reconstruction
-                )
-                generator_gan_loss = generator_adversarial_loss(
-                    discriminator, fake_frames
-                )
         mse_loss = F.mse_loss(
             output.tokenizer.reconstruction.float(), video.float()
         )
@@ -541,7 +594,6 @@ def run(args: argparse.Namespace) -> None:
             + config.loss.lpips_weight * lpips_loss.float()
             + config.loss.commitment_weight * commitment_loss
             + rate_weight * soft_bpp
-            + config.loss.gan_weight * generator_gan_loss.float()
         )
         total_loss.backward()
         grad_norm = torch.nn.utils.clip_grad_norm_(
@@ -552,27 +604,7 @@ def run(args: argparse.Namespace) -> None:
             device,
         )
         optimizer.step()
-
-        discriminator_loss = torch.zeros((), device=device)
-        discriminator_grad_norm = torch.zeros((), device=device)
-        if gan_active:
-            discriminator_loss = discriminator_microbatch_backward(
-                ddp_discriminator,
-                real_frames,
-                fake_frames,
-                loss_weight=config.loss.gan_weight,
-                gradient_accumulation=1,
-            )
-            discriminator_grad_norm = torch.nn.utils.clip_grad_norm_(
-                discriminator.parameters(), config.optimizer.grad_clip_norm
-            )
-            collective_error(
-                None
-                if torch.isfinite(discriminator_grad_norm)
-                else f"non-finite discriminator gradient at step {step}",
-                device,
-            )
-            discriminator_optimizer.step()
+        scheduler.step()
 
         psnr = 10.0 * torch.log10(4.0 / mse_loss.detach())
         histogram = torch.bincount(
@@ -594,10 +626,7 @@ def run(args: argparse.Namespace) -> None:
                     soft_bpp.detach(),
                     hard_bpp.detach(),
                     psnr,
-                    generator_gan_loss.detach().float(),
-                    discriminator_loss.detach().float(),
                     grad_norm.detach().float(),
-                    discriminator_grad_norm.detach().float(),
                 )
             )
         )
@@ -618,20 +647,17 @@ def run(args: argparse.Namespace) -> None:
                 "mse": float(scalars[1]),
                 "lpips": float(scalars[2]),
                 "commitment": float(scalars[3]),
-                "generator_gan": float(scalars[7]),
-                "discriminator": float(scalars[8]),
             },
             "rate_weight": rate_weight,
             "temperature": temperature,
             "tokenizer_learning_rate": tokenizer_learning_rate,
             "entropy_learning_rate": entropy_learning_rate,
-            "gan_active": gan_active,
+            "discriminator_training": False,
             "codebook": {
                 "active": int(active.sum()),
                 "perplexity": float(perplexity),
             },
-            "grad_norm": float(scalars[9]),
-            "discriminator_grad_norm": float(scalars[10]),
+            "grad_norm": float(scalars[7]),
         }
         if rank == 0:
             with metrics_path.open("a", encoding="utf-8") as handle:
@@ -650,7 +676,7 @@ def run(args: argparse.Namespace) -> None:
                     f"lambda={rate_weight:.4f} tau={temperature:.4f} "
                     f"tokenizer_lr={tokenizer_learning_rate:.8g} "
                     f"entropy_lr={entropy_learning_rate:.8g} "
-                    f"gan={gan_active} latency_ms={metrics['latency_ms']:.3f}",
+                    f"latency_ms={metrics['latency_ms']:.3f}",
                 )
 
         if step % config.train.checkpoint_interval == 0:
@@ -659,8 +685,6 @@ def run(args: argparse.Namespace) -> None:
                 checkpoint_path,
                 model,
                 optimizer,
-                discriminator,
-                discriminator_optimizer,
                 config,
                 loaded.name,
                 loaded.checkpoint,
@@ -673,29 +697,23 @@ def run(args: argparse.Namespace) -> None:
                 device=device,
             )
             optimizer.zero_grad(set_to_none=True)
-            discriminator_optimizer.zero_grad(set_to_none=True)
             del output, video, lpips_loss, mse_loss, commitment_loss
-            del soft_bpp, hard_bpp, total_loss, generator_gan_loss
-            del discriminator_loss, discriminator_grad_norm, scalars, latency_ms
+            del soft_bpp, hard_bpp, total_loss, scalars, latency_ms
             del histogram, probabilities, active, perplexity, grad_norm, psnr
-            if gan_active:
-                del real_frames, fake_frames
-            del ddp_model, ddp_discriminator
-            ddp_model, ddp_discriminator = evaluate_checkpoint_in_subprocess(
+            del ddp_model
+            ddp_model = evaluate_checkpoint_in_subprocess(
                 args,
                 checkpoint_path,
                 output_dir / "evaluations" / f"step_{step:07d}",
                 model,
                 optimizer,
-                discriminator,
-                discriminator_optimizer,
                 lpips_metric,
                 rank=rank,
                 local_rank=local_rank,
+                world_size=world_size,
                 device=device,
             )
             model.train()
-            discriminator.train()
             lpips_metric.eval()
 
     if progress is not None:
@@ -704,6 +722,8 @@ def run(args: argparse.Namespace) -> None:
 
 def main() -> None:
     args = parse_args()
+    if args.resume is not None and args.init_checkpoint is not None:
+        raise ValueError("Use either --resume or --init-checkpoint, not both")
     dist.init_process_group("nccl", timeout=timedelta(hours=6))
     try:
         run(args)

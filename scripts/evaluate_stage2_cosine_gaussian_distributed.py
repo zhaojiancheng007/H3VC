@@ -14,7 +14,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from entropy_model.model_categorical import CategoricalEntropyModel
 from metrics.lpips import create_standard_lpips
 from metrics.reporting import write_json
-from scripts.stage2_cosine import load_checkpoint
+from scripts.stage2 import load_checkpoint
 from tokenizer.gaussian_tile_decode import (
     enable_gaussian_tile_decode,
     gaussian_tile_blend_protocol,

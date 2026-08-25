@@ -1,5 +1,7 @@
 import json
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 import torch.nn as nn
@@ -16,7 +18,7 @@ from tokenizer.stage1_vq import (
     EMAVectorQuantizer,
     Stage1VQTokenizer,
 )
-from training.config_stage1 import (
+from training.config_stage1_cosine import (
     learning_rate_at_step,
     load_stage1_training_config,
 )
@@ -125,17 +127,31 @@ def test_checkpoint_contains_general_stage1_state(tmp_path) -> None:
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
     path = tmp_path / "step_0005000.pt"
 
-    save_checkpoint(
-        path,
-        model,
-        optimizer,
-        "wanvae",
-        input_frames=97,
-        latent_channels=16,
-        codebook_dim=16,
-        config={"train": {}},
-        step=5000,
-    )
+    def gather(output, value):
+        output[0] = value
+
+    stream = SimpleNamespace(checkpoint_position=lambda: (3, 7))
+    with (
+        patch("scripts.stage1.capture_rng_state", return_value={"rank": 0}),
+        patch("scripts.stage1.dist.all_gather_object", side_effect=gather),
+        patch("scripts.stage1.dist.barrier"),
+    ):
+        save_checkpoint(
+            path,
+            model,
+            optimizer,
+            "wanvae",
+            input_frames=97,
+            latent_channels=16,
+            codebook_dim=16,
+            config={"train": {"max_steps": 60_000}},
+            step=5000,
+            stream=stream,
+            world_size=1,
+            global_batch_size=8,
+            rank=0,
+            device=torch.device("cpu"),
+        )
     payload = torch.load(path, map_location="cpu", weights_only=False)
 
     assert CHECKPOINT_INTERVAL == 5000
@@ -143,10 +159,14 @@ def test_checkpoint_contains_general_stage1_state(tmp_path) -> None:
     assert payload["tokenizer"] == "wanvae"
     assert payload["step"] == 5000
     assert payload["quantizer_geometry"] == "raw_l2"
+    assert payload["version"] == 3
+    assert payload["training_state"]["batch_in_epoch"] == 7
+    assert payload["training_state"]["global_batch_size"] == 8
+    assert payload["rng_states"] == [{"rank": 0}]
     assert set(payload["model"]) == set(model.state_dict())
 
 
-def test_h3_107_frame_piecewise_schedule_and_best_policy() -> None:
+def test_h3_107_frame_cosine_schedule_and_best_policy() -> None:
     config = load_stage1_training_config(
         Path("configs/stage1.yaml")
     )
@@ -154,14 +174,12 @@ def test_h3_107_frame_piecewise_schedule_and_best_policy() -> None:
     assert config.train.max_steps == 60_000
     assert config.train.checkpoint_interval == 5_000
     assert config.train.checkpoint_policy == "best_lpips"
-    assert learning_rate_at_step(config.optimizer, 0) == 1e-4
-    assert learning_rate_at_step(config.optimizer, 14_999) == 1e-4
-    assert learning_rate_at_step(config.optimizer, 15_000) == 5e-5
-    assert learning_rate_at_step(config.optimizer, 29_999) == 5e-5
-    assert learning_rate_at_step(config.optimizer, 30_000) == 1e-5
-    assert learning_rate_at_step(config.optimizer, 44_999) == 1e-5
-    assert learning_rate_at_step(config.optimizer, 45_000) == 5e-6
-    assert learning_rate_at_step(config.optimizer, 60_000) == 5e-6
+    first = learning_rate_at_step(config.optimizer, config.train.max_steps, 1)
+    middle = learning_rate_at_step(config.optimizer, config.train.max_steps, 30_000)
+    last = learning_rate_at_step(config.optimizer, config.train.max_steps, 60_000)
+    assert first == 1e-4
+    assert first > middle > last
+    assert last == 5e-6
 
 
 def test_best_lpips_policy_keeps_only_the_best_checkpoint(tmp_path: Path) -> None:

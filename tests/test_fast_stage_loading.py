@@ -11,10 +11,12 @@ import torch
 from datasets.openvid_mp4_sequence import TrainingSampleKey
 from datasets.trainable_jsons_sequence_fast import (
     SeededFastTrainableJsonsVideoDataset,
+    VideoDecodeError,
     load_mp4_window_resize_crop,
 )
 from training.checkpoint_config_fast import assert_fast_loader_resume_config
 from training.distributed_runtime_fast import build_video_dataloader_fast
+from training.stage_data_fast import build_stage_dataset_fast
 
 
 class FakeVideoCapture:
@@ -119,9 +121,80 @@ def test_fast_dataset_replays_seed_and_fails_decode_directly(tmp_path: Path) -> 
 
     with patch(
         "datasets.trainable_jsons_sequence_fast.load_mp4_window_resize_crop",
-        side_effect=RuntimeError("decode failed"),
-    ), pytest.raises(RuntimeError, match="decode failed"):
+        side_effect=VideoDecodeError("decode failed"),
+    ), pytest.raises(VideoDecodeError, match="decode failed"):
         dataset[key]
+
+
+def test_fast_dataset_deterministically_replaces_decode_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    dataset_root, metadata_dir, _ = _write_metadata(tmp_path)
+    metadata_file = metadata_dir / "valid_all_chunk_1.json"
+    payload = json.loads(metadata_file.read_text(encoding="utf-8"))
+    replacement_path = dataset_root / "videos" / "replacement.mp4"
+    replacement_path.touch()
+    payload["clips"].append(
+        {
+            **payload["clips"][0],
+            "video_path": "/workspace/gemini/videos/replacement.mp4",
+        }
+    )
+    metadata_file.write_text(json.dumps(payload), encoding="utf-8")
+    rejection_log = tmp_path / "rejected_samples.jsonl"
+    dataset = SeededFastTrainableJsonsVideoDataset(
+        dataset_root,
+        metadata_dir,
+        num_frames=25,
+        rejection_log=rejection_log,
+    )
+    monkeypatch.setenv("RANK", "3")
+    decoded = torch.zeros((25, 3, 256, 256), dtype=torch.uint8)
+    key = TrainingSampleKey(index=0, crop_seed=41)
+
+    with patch(
+        "datasets.trainable_jsons_sequence_fast.load_mp4_window_resize_crop",
+        side_effect=[VideoDecodeError("decode failed"), decoded],
+    ) as load:
+        video = dataset[key]
+
+    assert load.call_args_list[0].args[0] != load.call_args_list[1].args[0]
+    assert video.shape == (3, 25, 256, 256)
+    record = json.loads(rejection_log.read_text(encoding="utf-8"))
+    assert record["rank"] == 3
+    assert record["rejected_index"] == 0
+    assert record["replacement_index"] == 1
+    assert record["error"] == "decode failed"
+
+
+def test_fast_dataset_does_not_hide_non_decode_runtime_error(tmp_path: Path) -> None:
+    dataset_root, metadata_dir, _ = _write_metadata(tmp_path)
+    dataset = SeededFastTrainableJsonsVideoDataset(
+        dataset_root,
+        metadata_dir,
+        num_frames=25,
+        rejection_log=tmp_path / "rejected_samples.jsonl",
+    )
+
+    with patch(
+        "datasets.trainable_jsons_sequence_fast.load_mp4_window_resize_crop",
+        side_effect=RuntimeError("unexpected failure"),
+    ), pytest.raises(RuntimeError, match="unexpected failure"):
+        dataset[TrainingSampleKey(index=0, crop_seed=41)]
+
+
+def test_fast_stage_builder_enables_rejection_log(tmp_path: Path) -> None:
+    dataset_root, metadata_dir, _ = _write_metadata(tmp_path)
+    output_dir = tmp_path / "output"
+    dataset = build_stage_dataset_fast(
+        "trainable_jsons",
+        dataset_root,
+        metadata_dir,
+        num_frames=25,
+        output_dir=output_dir,
+    )
+
+    assert dataset.rejection_log == output_dir / "rejected_samples.jsonl"
 
 
 def test_fast_dataloader_requires_benchmarked_worker_count() -> None:

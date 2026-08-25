@@ -12,7 +12,7 @@ from training.evaluation_categorical import (
     MCL_JCV_SEQUENCES,
     UVG_SEQUENCES,
 )
-from scripts.stage2_cosine import evaluation_command
+from scripts.stage2 import evaluation_command
 from training.evaluation_categorical_distributed import (
     SequenceJob,
     build_benchmark_jobs,
