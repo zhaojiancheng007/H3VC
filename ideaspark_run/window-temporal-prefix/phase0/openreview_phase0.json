@@ -1,0 +1,40 @@
+[
+ {
+  "title": "MoECodec: Image Compression for joint human and machine perception via Mixture-of-Experts",
+  "title_norm": "moecodec image compression for joint human and machine perception via mixture of",
+  "abstract": "Image compression for machines calls for a unified codec that serves multiple downstream vision tasks. Existing approaches either adopt task-specific end-to-end designs, raising parameter and deployment overhead, or rely on transfer-based adaptations that remain externally attached and heuristic task design. A key limitation shared by both lines of work is their largely static computation pattern, which applies similar transformations across tokens despite the fact that different image regions exhibit markedly different semantic importance and complexity for machine perception. We propose MoECodec, a token-aware image compression framework that supports multiple downstream tasks within a single model. MoECodec replaces the FFN layers in transformer-based compression model token-wise Mixture-of-Experts (MoE), enabling dynamic, token-level computation conditioned on the input content and task objective. To make MoE effective in compression model, we introduce a stable routing strategy that combines expert-choice routing with spatial total variation regularization to encourage spatially coherent assignments, and we propose a lightweight expert architecture, Group Shuffle MLP (GShMLP), to control parameter growth. Extensive experiments show consistent improvement against baselines on both conventional image reconstruction and machine tasks.",
+  "year": 2026,
+  "venue": "NeurIPS.cc/2026/Conference",
+  "authors": [
+   "Jiancheng Zhao"
+  ],
+  "citations": null,
+  "source": "openreview",
+  "source_id": "hyVVuB5WLQ",
+  "doi": "",
+  "paper_url": "https://openreview.net/forum?id=hyVVuB5WLQ",
+  "published_iso": "",
+  "_score": 2
+ },
+ {
+  "title": "HaRP: High Dynamic Range Photosequencing through Dual Reversed Shutter Scanning",
+  "title_norm": "harp high dynamic range photosequencing through dual reversed shutter scanning",
+  "abstract": "The adoption of CMOS sensors in mobile photography is frequently compromised by the rolling shutter (RS) effect, which introduces geometric distortions and motion artifacts. Particularly, recent rolling shutter with global reset (RSGR) mode, while mitigating some RS issues, also incurs major limitations, including reduced capture speed and compressed dynamic range. To address these problems, we propose a novel dual reversed scanning setup utilizing both RSGR and inverted RSGR views. This solution not only handles the inherent flaws of RSGR by synchronizing complementary exposures to balance the dynamic range across the frames but also introduces an effective method for HDR photosequencing under highly dynamic scenes. Our proposed network first accommodates row-wise complementarity and manages visual shifts by row-adaptive feature alignment. Subsequently, the hallucination module, built upon a correlation-guided mix-attention block, integrates the mutually reinforced features to recover missing details. In addition, we construct a coaxial imaging system to collect a real-world dataset, enabling robust training and evaluation beyond numerical simulation. Experimental results demonstrate the twofold benefits of our solution in mitigating RSGR limitations and advancing HDR reconstruction techniques.",
+  "year": 2026,
+  "venue": "NeurIPS.cc/2026/Conference",
+  "authors": [
+   "Xiang Ji",
+   "Guixu Lin",
+   "Jiancheng Zhao",
+   "Zhengwei Yin",
+   "Yinqiang Zheng"
+  ],
+  "citations": null,
+  "source": "openreview",
+  "source_id": "gntboEoHJi",
+  "doi": "",
+  "paper_url": "https://openreview.net/forum?id=gntboEoHJi",
+  "published_iso": "",
+  "_score": 2
+ }
+]
