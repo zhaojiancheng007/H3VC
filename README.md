@@ -1,156 +1,186 @@
-# ARCodec
+# H3VC
 
-ARCodec trains one video VQ tokenizer, one categorical entropy model, and then
-jointly optimizes both for rate-distortion performance.
+Three-stage video codec training with a MiniMax-H3 VAE, a single 4096 × 24
+EMA vector-quantization codebook, and either a **local-only** or
+**global-local FIFO-memory** entropy model.
 
-## Clone
+This release provides training, reconstruction, and **estimated entropy bpp**.
+It does not produce or decode an arithmetic-coded bitstream. Model weights,
+datasets, experiment logs, and reconstructed videos are not included.
 
-Wan2.1 and Cosmos-Tokenizer are pinned Git submodules. Clone the complete
-source tree with:
+## Installation
 
-```bash
-git clone --recurse-submodules https://github.com/zhaojiancheng007/ARCodec-.git
-```
-
-For an existing clone, initialize the dependencies with:
-
-```bash
-git submodule update --init --recursive
-```
-
-Datasets, pretrained weights, checkpoints, logs, reconstructions, and generated
-plots are local artifacts and are not stored in Git. Small structured loader
-benchmarks under `outputs/benchmarks/` are the only versioned output artifacts.
-
-The current train-eval pipeline has one entry per stage:
-
-| Stage | Canonical entry | Integrated behavior |
-| --- | --- | --- |
-| 1 | `scripts/stage1.py` | cosine LR, high-throughput loader, bad-video replacement, distributed eval, resume |
-| 2 | `scripts/stage2.py` | cosine LR, batch size 2/GPU, high-throughput loader, distributed eval, resume |
-| 3 | `scripts/stage3.py` | configurable λ, no discriminator, high-throughput loader, distributed eval, resume |
-
-These entries use the canonical `configs/stage1.yaml`, `configs/stage2.yaml`,
-and `configs/stage3.yaml` files. GPU count is
-selected at launch through `torchrun --nproc_per_node`; it is not fixed by the
-repository. A checkpoint must resume with the same `world_size` and global
-batch size. Superseded primary training wrappers are not retained.
-
-The complete checkpoint, distributed eval, resume, metric, and reconstruction
-contract is fixed in [docs/train_eval_workflow.md](docs/train_eval_workflow.md).
-
-## Shared representation
-
-The checked-in configs target MiniMax-H3 and its 24-channel latent grid:
-
-```text
-video [B,3,107,H,W]
-→ MiniMax-H3 encoder
-→ pre_quant 24→24
-→ one 4096×24 EMA-VQ codebook
-→ one index per latent position [B,T′,H′,W′]
-→ post_quant 24→24
-→ matching decoder
-```
-
-Each index is in `[0,4095]` and requires 12 raw bits before entropy coding.
-There is no RVQ and no extra index dimension.
-
-## Stage 1
-
-Stage1 jointly trains the encoder, projections, and decoder. The codebook is
-initialized with ten Lloyd iterations and then updated from global DDP EMA
-assignment statistics.
-
-```text
-loss = 1.0 × MSE + 1.0 × LPIPS-VGG + 0.25 × commitment
-```
+Tested with Python 3.11, PyTorch 2.5.1 / CUDA 12.1 and H100 GPUs.
+Run commands from the repository root in a dedicated environment:
 
 ```bash
-torchrun --standalone --nproc_per_node=<gpu_count> scripts/stage1.py \
-  --tokenizer minimax_h3 \
-  -c configs/stage1.yaml \
-  --dataset-root /ddn/team/shared/gemini \
-  --metadata /zjc/ARCodec/data/trainable_jsons_v1_filtered_decode_failures_step0 \
-  --uvg-root /luojx/data/UVG \
-  --mcl-jcv-root /luojx/data/MCL-JCV/figure4_bt709_first96 \
-  --hevc-b-root /luojx/data/HEVC-B/figure4_bt709_first96 \
-  --minimax-h3-model-dir /data/heli/model/MiniMax-H3/FL2VA/video_vae \
-  --output-dir outputs/stage1_h3
+python -m venv .venv
+source .venv/bin/activate
+pip install torch==2.5.1 torchvision==0.20.1 --index-url https://download.pytorch.org/whl/cu121
+pip install -r requirements.txt
+pip install pytest
 ```
 
-## Stage 2
-
-Stage2 freezes the complete Stage1 tokenizer. The selected 24-dimensional code
-vectors are the context and the target is one complete 4096-way index:
-
-```text
-video
-→ frozen Stage1 tokenizer
-→ quantized features + indices
-→ four-group, fixed 8×8-window categorical entropy model
-→ 4096 logits per latent position
-
-loss = total negative log₂ probability / number of indices
-```
+Download the external VAE code, configuration, and weights from the
+[official MiniMax-H3 repository](https://huggingface.co/MiniMaxAI/MiniMax-H3/tree/main/FL2VA/video_vae):
 
 ```bash
-torchrun --standalone --nproc_per_node=<gpu_count> scripts/stage2.py \
-  -c configs/stage2.yaml \
-  --dataset-root /ddn/team/shared/gemini \
-  --metadata /zjc/ARCodec/data/trainable_jsons_v1_filtered_decode_failures_step0 \
-  --uvg-root /luojx/data/UVG \
-  --mcl-jcv-root /luojx/data/MCL-JCV/figure4_bt709_first96 \
-  --hevc-b-root /luojx/data/HEVC-B/figure4_bt709_first96 \
-  --minimax-h3-model-dir /data/heli/model/MiniMax-H3/FL2VA/video_vae \
-  --tokenizer-checkpoint outputs/stage1_h3/checkpoints/checkpoint_best.pt \
-  --output-dir outputs/stage2_h3
+hf download MiniMaxAI/MiniMax-H3 --include 'FL2VA/video_vae/*' --local-dir pretrained_ckpts/MiniMax-H3
+export VAE_DIR="$PWD/pretrained_ckpts/MiniMax-H3/FL2VA/video_vae"
 ```
 
-The tokenizer type is read from the Stage1 checkpoint, so the same command also
-supports WanVAE checkpoints.
+The model directory must contain `minimax_h3_video_vae.py`, `config.json`,
+and `source/` with the pretrained model. Its Python code is imported at runtime;
+use the trusted upstream source. See [third-party notices](THIRD_PARTY_NOTICES.md).
+LPIPS/DISTS may download their pretrained metric weights on first use.
 
-## Stage 3
+## Repository layout
 
-Stage3 loads the exact Stage1 checkpoint used by Stage2. One 4096-way distance
-matrix produces both the hard index and the differentiable soft target.
-The EMA codebook remains frozen; tokenizer projections, encoder/decoder, and
-entropy model are trainable.
+- `scripts/stage1.py`: tokenizer training with EMA VQ.
+- `scripts/stage2.py`: frozen-tokenizer entropy training; configuration selects the model.
+- `scripts/stage3.py`: joint rate-distortion training with a soft marginal entropy floor.
+- `scripts/inference.py`: one PNG sequence → reconstructions and `metrics.json`.
+- `scripts/evaluate.py`: UVG / MCL-JCV / HEVC-B benchmark shard.
+- `entropy_model/`: only local-only and global-local model implementations.
+- `tokenizer/`, `training/`, `datasets/`, `metrics/`: their required runtime code.
 
-```text
-loss = 1.0 × MSE
-     + 1.0 × LPIPS-VGG
-     + 0.25 × commitment
-     + λ × soft_bpp
-```
+## Data
 
-λ is read from `loss.rate_weight`; use one explicit config per RD point. The
-canonical Stage3 config has no GAN fields and the training path never builds
-or updates a discriminator.
+Training uses MP4 videos and JSON metadata; paths are relative to `DATA_ROOT`.
+See [data format](docs/data.md) and `examples/valid_all_chunk_0.json`.
+Each training sample is 107 RGB frames. The shorter spatial side is resized to
+512 with OpenCV cubic interpolation, followed by a seeded 256 × 256 crop.
+
+Benchmark input is RGB PNG frames, numbered `000001.png` through `000096.png`
+(or the original benchmark frame names supported by the loader), at 1920 × 1080.
+The exact dataset directory names are documented in [data format](docs/data.md).
 
 ```bash
-torchrun --standalone --nproc_per_node=<gpu_count> scripts/stage3.py \
+export DATA_ROOT=/path/to/training/videos
+export META_DIR=/path/to/metadata
+export UVG_ROOT=/path/to/UVG
+export MCL_ROOT=/path/to/MCL-JCV/frames
+export HEVC_ROOT=/path/to/HEVC-B/frames
+```
+
+## Training
+
+All three stages use `torchrun`, cosine schedules, deterministic sampler/RNG
+checkpointing, and subprocess benchmark evaluation. Stage1 and Stage2 select the
+best checkpoint by UVG LPIPS and bpp, respectively. Stage3 keeps every 5k checkpoint.
+The published Stage3 recipe requires **8 GPUs, batch size 1/GPU**. Stage2 uses
+batch size 2/GPU (the global-local experiment used 4 GPUs). GPU memory requirements
+depend on the VAE; CPU unit tests are not a substitute for a full training run.
+
+### Stage 1 — tokenizer
+
+```bash
+torchrun --standalone --nproc_per_node=8 scripts/stage1.py \
+  --tokenizer minimax_h3 -c configs/stage1.yaml \
+  --dataset-root "$DATA_ROOT" --metadata "$META_DIR" \
+  --output-dir results/stage1 --minimax-h3-model-dir "$VAE_DIR" \
+  --uvg-root "$UVG_ROOT" --mcl-jcv-root "$MCL_ROOT" --hevc-b-root "$HEVC_ROOT"
+```
+
+Set `S1` to the resulting tokenizer checkpoint. The experiments used step 55k
+from a 60k cosine schedule; select the checkpoint deliberately.
+
+### Stage 2 — entropy model
+
+```bash
+export S1=/path/to/stage1/checkpoint.pt
+torchrun --standalone --nproc_per_node=4 scripts/stage2.py \
+  -c configs/stage2_local_global_memory.yaml --k 1 \
+  --dataset-root "$DATA_ROOT" --metadata "$META_DIR" \
+  --tokenizer-checkpoint "$S1" --output-dir results/stage2 \
+  --minimax-h3-model-dir "$VAE_DIR" \
+  --uvg-root "$UVG_ROOT" --mcl-jcv-root "$MCL_ROOT" --hevc-b-root "$HEVC_ROOT"
+```
+
+Use `configs/stage2_local.yaml` for local-only training. Both released training
+recipes use fixed K=1. Global-local uses 8 × 8 spatial windows, 512 FIFO memory
+tokens, 32 summary tokens/frame, and 32 readout tokens with two readout layers.
+
+### Stage 3 — rate-distortion tuning
+
+```bash
+export S2=/path/to/stage2/checkpoint_best.pt
+torchrun --standalone --nproc_per_node=8 scripts/stage3.py \
   -c configs/stage3.yaml \
-  --dataset-root /ddn/team/shared/gemini \
-  --metadata /zjc/ARCodec/data/trainable_jsons_v1_filtered_decode_failures_step0 \
-  --uvg-root /luojx/data/UVG \
-  --mcl-jcv-root /luojx/data/MCL-JCV/figure4_bt709_first96 \
-  --hevc-b-root /luojx/data/HEVC-B/figure4_bt709_first96 \
-  --minimax-h3-model-dir /data/heli/model/MiniMax-H3/FL2VA/video_vae \
-  --tokenizer-checkpoint outputs/stage1_h3/checkpoints/checkpoint_best.pt \
-  --entropy-checkpoint outputs/stage2_h3/checkpoints/checkpoint_best.pt \
-  --output-dir outputs/stage3_h3
+  --dataset-root "$DATA_ROOT" --metadata "$META_DIR" \
+  --tokenizer-checkpoint "$S1" --entropy-checkpoint "$S2" \
+  --output-dir results/stage3 --minimax-h3-model-dir "$VAE_DIR" \
+  --marginal-entropy-floor-bits 10.965784284662087 --entropy-floor-multiplier 1 \
+  --uvg-root "$UVG_ROOT" --mcl-jcv-root "$MCL_ROOT" --hevc-b-root "$HEVC_ROOT"
 ```
 
-## Outputs
+The default is λ=7.2, τ=0.1, P=2000, 40k steps; H_min = log₂(P).
+Edit `loss.rate_weight` and `loss.temperature` in your config. An existing Stage3
+checkpoint can initialize a new RD point with `--init-checkpoint PATH`: **weights
+only**, fresh optimizer/scheduler, step 0. `--resume PATH` instead restores full
+training state and requires the same configuration and world size. Do not combine
+them. Original research checkpoints can initialize new runs; the old GAN-placeholder
+configuration is not a resume configuration for this cleaned release.
 
-Every 5000 steps, all three stages distribute the 42-video UVG, MCL-JCV, and
-HEVC-B benchmark across all training ranks and use Gaussian spatial-tile
-blending. Stage1 retains the lowest-LPIPS checkpoint, Stage2 retains the
-lowest-BPP checkpoint, and Stage3 retains every 5000-step checkpoint. Benchmark
-JSON contains `psnr`, `bpp`, `latency_ms`, `lpips_vgg`, `lpips_alex`, and
-`dists`. Only Stage3 saves reconstructions, with one canonical recon archive
-per λ.
+Use `--allow-checkpoint-relocation` only when explicitly supplied Stage1/Stage2
+paths are relocated copies of the original files. Model state loading remains strict.
+`--stop-after-steps N` limits additional steps, without changing the cosine period.
 
-Training metrics are written to `train_metrics.jsonl`, compact logs to
-`training.log`, and the exact run configuration to `run_manifest.json`.
+See [training and evaluation](docs/training.md) for losses, floors, and validation.
+
+## Reconstruction / inference
+
+Supply a Stage3 checkpoint and its Stage1/Stage2 source checkpoints. Paths are
+explicit, so inference does not rely on absolute paths embedded in checkpoints.
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python scripts/inference.py \
+  --checkpoint /path/to/stage3/checkpoint.pt \
+  --tokenizer-checkpoint "$S1" --entropy-checkpoint "$S2" \
+  --minimax-h3-model-dir "$VAE_DIR" \
+  --frames-dir /path/to/sequence --output-dir outputs/example
+```
+
+The output directory must be new. Outputs are 96 reconstructed PNGs under
+`recon/input/<sequence>/` and `metrics.json`, including PSNR, bpp, LPIPS-VGG,
+DISTS, latency_ms, perplexity, active codes, marginal entropy, and coding cost/token.
+No training loss is computed in inference.
+
+## Benchmark evaluation
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python scripts/evaluate.py \
+  --checkpoint /path/to/stage3/checkpoint.pt \
+  --tokenizer-checkpoint "$S1" --entropy-checkpoint "$S2" \
+  --minimax-h3-model-dir "$VAE_DIR" \
+  --uvg-root "$UVG_ROOT" --mcl-jcv-root "$MCL_ROOT" --hevc-b-root "$HEVC_ROOT" \
+  --rank 0 --world-size 1 --k 1 \
+  --output outputs/eval.json --recon-dir outputs/recon
+```
+
+This runs all 42 sequences sequentially on one GPU. For sharding, launch one
+independent process per GPU with distinct rank/output, and the same world size.
+Stage3's periodic evaluator does this automatically and writes per-dataset JSON,
+`summary.json`, and `summary.csv`. The standard protocol scores 96 frames at
+1080p, feeds 107 frames (last-frame repetition), uses spatial padding/cropping
+and Gaussian decoder tile blending (variance 0.01). Estimated bpp is normalized
+by the original 96-frame pixel count. Latency includes encode, VQ, entropy
+estimation, and decode, but excludes metrics and PNG writes; it is **not**
+bitstream encoder/decoder latency.
+
+## Tests
+
+```bash
+OMP_NUM_THREADS=1 python -m pytest -q
+```
+
+Tests cover both entropy models, causal context, soft-rate gradients, frozen
+codebook behavior, floor gradients, configuration loading, and independent imports.
+No dataset or VAE weights are needed for CPU tests. Full GPU training/evaluation
+requires the external VAE and datasets.
+
+## License
+
+H3VC code is MIT-licensed. External VAE code, pretrained weights, datasets,
+and metric packages retain their own licenses. No third-party weights are
+redistributed here.

@@ -13,7 +13,6 @@ from torch.utils.data import Dataset, get_worker_info
 from .openvid_mp4_sequence import TrainingSampleKey
 
 
-JSON_MOUNT_ROOT = PurePosixPath("/workspace/gemini")
 RESIZE_SHORT_SIDE = 512
 CROP_SIZE = 256
 MAX_DECODE_ATTEMPTS = 16
@@ -124,8 +123,8 @@ class SeededFastTrainableJsonsVideoDataset(Dataset[torch.Tensor]):
                 if video_length < num_frames:
                     continue
                 json_path = PurePosixPath(record["video_path"])
-                relative_path = json_path.relative_to(JSON_MOUNT_ROOT)
-                if ".." in relative_path.parts or relative_path.suffix.lower() != ".mp4":
+                relative_path = json_path
+                if relative_path.is_absolute() or ".." in relative_path.parts or relative_path.suffix.lower() != ".mp4":
                     raise ValueError(f"Unsafe video path in {metadata_file}: {json_path}")
                 video_path = self.dataset_root.joinpath(*relative_path.parts)
                 self.video_paths.append(video_path)

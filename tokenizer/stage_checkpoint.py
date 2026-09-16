@@ -27,13 +27,7 @@ class LoadedStage1Tokenizer:
 def load_stage1_tokenizer(
     checkpoint: str | Path,
     *,
-    wan_repo: str | Path,
-    wan_checkpoint: str | Path,
-    cosmos_repo: str | Path,
-    cosmos_encoder: str | Path,
-    cosmos_decoder: str | Path,
-    cosmos_cv888_encoder: str | Path,
-    cosmos_cv888_decoder: str | Path,
+
     minimax_h3_model_dir: str | Path,
 ) -> LoadedStage1Tokenizer:
     checkpoint = Path(checkpoint).resolve()
@@ -85,14 +79,9 @@ def load_stage1_tokenizer(
 
     backbone = build_backbone(
         name,
-        wan_repo=wan_repo,
-        wan_checkpoint=wan_checkpoint,
-        cosmos_repo=cosmos_repo,
-        cosmos_cv488_encoder=cosmos_encoder,
+
         minimax_h3_training_frames=int(payload["input_frames"]),
-        cosmos_cv488_decoder=cosmos_decoder,
-        cosmos_cv888_encoder=cosmos_cv888_encoder,
-        cosmos_cv888_decoder=cosmos_cv888_decoder,
+
         minimax_h3_model_dir=minimax_h3_model_dir,
     )
     model = Stage1VQTokenizer(

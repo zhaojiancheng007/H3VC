@@ -1,35 +1,19 @@
-# Python caches and local environments
 __pycache__/
 *.py[cod]
 .pytest_cache/
-.mypy_cache/
-.ruff_cache/
+*.egg-info/
+build/
+dist/
 .venv/
-venv/
-
-# Machine-local configuration
 .env
 .env.*
-!.env.example
-
-# Datasets, checkpoints, and experiment outputs
-/data/
-/outputs/*
-!/outputs/benchmarks/
-!/outputs/benchmarks/**
-/results/
-/pretrained_ckpts/
+pretrained_ckpts/
+checkpoints/
+results/
+outputs/
+recon/
 *.pt
 *.pth
-*.ckpt
 *.safetensors
-*.jit
-*.onnx
-*.log
-
-# Generated plots and patch leftovers
-/plots/output/
-*.orig
-*.rej
-*~
-.DS_Store
+*.mp4
+*.yuv

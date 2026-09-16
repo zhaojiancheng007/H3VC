@@ -8,12 +8,6 @@ from datasets.trainable_jsons_sequence_fast import (
 
 
 DEFAULT_DATASET_FORMAT = "trainable_jsons"
-DEFAULT_DATASET_ROOT = "/ddn/gemini"
-DEFAULT_METADATA = (
-    Path(__file__).resolve().parents[1]
-    / "data"
-    / "trainable_jsons_v1_filtered_decode_failures_step0"
-)
 
 
 def build_stage_dataset_fast(

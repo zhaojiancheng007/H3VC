@@ -4,12 +4,6 @@ import argparse
 import sys
 from pathlib import Path
 
-DISTRIBUTED_GAUSSIAN_EVALUATORS = {
-    1: "evaluate_stage1_tokenizer_gaussian_distributed.py",
-    2: "evaluate_stage2_cosine_gaussian_distributed.py",
-    3: "evaluate_stage3_cosine_gaussian_distributed.py",
-}
-
 
 def distributed_evaluation_command(
     args: argparse.Namespace,
@@ -20,9 +14,12 @@ def distributed_evaluation_command(
     world_size: int,
     project_root: Path,
 ) -> list[str]:
+    if stage not in {1, 2, 3}:
+        raise ValueError(f"stage must be 1, 2, or 3, got {stage}")
     command = [
         sys.executable,
-        str(project_root / "scripts" / DISTRIBUTED_GAUSSIAN_EVALUATORS[stage]),
+        str(project_root / "scripts" / f"stage{stage}.py"),
+        "eval-shard",
         "--checkpoint",
         str(checkpoint_path.resolve()),
         "--output",
@@ -42,24 +39,17 @@ def distributed_evaluation_command(
         command.extend(
             ("--recon-dir", str((evaluation_dir / "recon").resolve()))
         )
-    if stage in (2, 3):
-        command.extend(("--config", str(Path(args.config).resolve())))
+    if stage in {2, 3}:
+        command.extend(
+            (
+                "--config",
+                str(Path(args.config).resolve()),
+                "--k",
+                str(args.eval_k),
+            )
+        )
     command.extend(
         (
-            "--wan-repo",
-            args.wan_repo,
-            "--wan-checkpoint",
-            args.wan_checkpoint,
-            "--cosmos-repo",
-            args.cosmos_repo,
-            "--cosmos-encoder",
-            args.cosmos_encoder,
-            "--cosmos-decoder",
-            args.cosmos_decoder,
-            "--cosmos-cv888-encoder",
-            args.cosmos_cv888_encoder,
-            "--cosmos-cv888-decoder",
-            args.cosmos_cv888_decoder,
             "--minimax-h3-model-dir",
             args.minimax_h3_model_dir,
         )

@@ -13,6 +13,7 @@ import subprocess
 import sys
 import time
 
+from DISTS_pytorch import DISTS
 import numpy as np
 import torch
 import torch.distributed as dist
@@ -23,12 +24,16 @@ from torch.utils.data.distributed import DistributedSampler
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from entropy_model.model_categorical import CategoricalEntropyModel
+from entropy_model.model_local_global_memory import LocalGlobalMemoryEntropyModel
+from entropy_model.selection import normalize_stage2_checkpoint, build_model, architecture, checkpoint_version, config_from_checkpoint
+from entropy_model.layout import training_k_for_step, training_k_probabilities
+from metrics.lpips import create_standard_lpips
 from metrics.reporting import write_json
+from tokenizer.gaussian_tile_decode import enable_gaussian_tile_decode, gaussian_tile_blend_protocol
 from tokenizer.stage_checkpoint import load_stage1_tokenizer
 from training.training_state import DDPTrainingState
-from training.config_stage2_cosine import (
-    Stage2Config,
+from training.config_stage2_local_global_memory import (
+    LocalGlobalMemoryStage2Config,
     learning_rate_at_step,
     load_stage2_config,
     stage2_config_dict,
@@ -56,24 +61,63 @@ from training.distributed_runtime_fast import (
     build_video_dataloader_fast as build_video_dataloader,
 )
 
-from training.evaluation_categorical_distributed import merge_evaluation_shards
+from training.evaluation_categorical_distributed import (
+    build_benchmark_jobs,
+    evaluate_shard,
+    merge_evaluation_shards,
+)
+import training.evaluation_categorical_distributed as evaluation_distributed
 from training.periodic_benchmarks import evaluation_environment
 from training.periodic_benchmarks_gaussian import (
-    distributed_evaluation_command as evaluation_command,
+    distributed_evaluation_command as base_evaluation_command,
 )
+from training.video_losses import create_lpips_vgg
 
 
-CHECKPOINT_VERSION = 2
 
 
-def parse_args() -> argparse.Namespace:
+def evaluation_command(*args, **kwargs) -> list[str]:
+    command = base_evaluation_command(*args, **kwargs)
+    command[1] = str(PROJECT_ROOT / "scripts" / "stage2.py")
+    train_args = args[0]
+    if getattr(train_args, "eval_smoke", False):
+        command.append("--eval-smoke")
+    return command
+
+
+def merge_smoke_evaluation_shards(shards: list[dict]) -> dict[str, dict]:
+    world_size = int(shards[0]["world_size"])
+    if {int(shard["rank"]) for shard in shards} != set(range(world_size)):
+        raise ValueError("Smoke evaluation did not produce every rank shard")
+    if any(shard["protocol"] != shards[0]["protocol"] for shard in shards[1:]):
+        raise ValueError("Smoke evaluation shards disagree on protocol")
+    reports = [report for shard in shards for report in shard["sequences"]]
+    outputs = {}
+    for dataset in ("uvg", "mcl_jcv", "hevc_b"):
+        selected = [report for report in reports if report["dataset"] == dataset]
+        if not selected:
+            raise ValueError(f"Smoke evaluation has no {dataset} report")
+        outputs[dataset] = evaluation_distributed._aggregate_dataset(
+            dataset, selected, str(shards[0]["tokenizer"]), shards[0]["protocol"]
+        )
+        outputs[dataset]["checkpoint_step"] = int(shards[0]["checkpoint_step"])
+    return outputs
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Train one 4096-way entropy model for a Stage1 VQ tokenizer"
+        description="Train the local-only or global-local Stage2 entropy model"
     )
     parser.add_argument(
         "-c",
         "--config",
-        default=str(PROJECT_ROOT / "configs/stage2.yaml"),
+        default=str(PROJECT_ROOT / "configs/stage2_local_global_memory.yaml"),
+    )
+    parser.add_argument("--k", default=1, type=int, choices=(1, 2, 3, 4))
+    parser.add_argument(
+        "--mixed-prefix",
+        action="store_true",
+        help="Unsupported compatibility flag; this model requires fixed K=1",
     )
     parser.add_argument("--dataset-root", required=True)
     parser.add_argument(
@@ -93,28 +137,6 @@ def parse_args() -> argparse.Namespace:
         "--hevc-b-root",
         required=True,
     )
-    parser.add_argument("--wan-repo", default=str(PROJECT_ROOT / "Wan2.1"))
-    parser.add_argument(
-        "--wan-checkpoint",
-        default=str(PROJECT_ROOT / "pretrained_ckpts/Wan2.1/Wan2.1_VAE.pth"),
-    )
-    parser.add_argument("--cosmos-repo", default=str(PROJECT_ROOT / "Cosmos-Tokenizer"))
-    parser.add_argument(
-        "--cosmos-encoder",
-        default=str(PROJECT_ROOT / "pretrained_ckpts/Cosmos-0.1-Tokenizer-CV4x8x8/encoder.jit"),
-    )
-    parser.add_argument(
-        "--cosmos-decoder",
-        default=str(PROJECT_ROOT / "pretrained_ckpts/Cosmos-0.1-Tokenizer-CV4x8x8/decoder.jit"),
-    )
-    parser.add_argument(
-        "--cosmos-cv888-encoder",
-        default=str(PROJECT_ROOT / "pretrained_ckpts/Cosmos-0.1-Tokenizer-CV8x8x8/encoder.jit"),
-    )
-    parser.add_argument(
-        "--cosmos-cv888-decoder",
-        default=str(PROJECT_ROOT / "pretrained_ckpts/Cosmos-0.1-Tokenizer-CV8x8x8/decoder.jit"),
-    )
     parser.add_argument(
         "--minimax-h3-model-dir",
         required=True,
@@ -126,10 +148,35 @@ def parse_args() -> argparse.Namespace:
         help="Accept explicitly supplied source checkpoints as relocated exact copies",
     )
     parser.add_argument("--stop-after-steps", type=int)
-    return parser.parse_args()
+    parser.add_argument(
+        "--eval-smoke",
+        action="store_true",
+        help="Run one real benchmark sequence per evaluation rank for pipeline testing",
+    )
+    args = parser.parse_args(argv)
+    if args.k != 1 or args.mixed_prefix:
+        raise ValueError("The released training recipe requires --k 1 without mixed-prefix")
+    args.eval_k = args.k
+    return args
 
 
-def scheduler_scale(config: Stage2Config, scheduler_step: int) -> float:
+def parse_eval_args(argv: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Evaluate one Stage2 shard")
+    parser.add_argument("--checkpoint", required=True)
+    parser.add_argument("--config", required=True)
+    parser.add_argument("--k", required=True, type=int)
+    parser.add_argument("--output", required=True)
+    parser.add_argument("--rank", required=True, type=int)
+    parser.add_argument("--world-size", required=True, type=int)
+    parser.add_argument("--uvg-root", required=True)
+    parser.add_argument("--mcl-jcv-root", required=True)
+    parser.add_argument("--hevc-b-root", required=True)
+    parser.add_argument("--minimax-h3-model-dir", required=True)
+    parser.add_argument("--eval-smoke", action="store_true")
+    return parser.parse_args(argv)
+
+
+def scheduler_scale(config: LocalGlobalMemoryStage2Config, scheduler_step: int) -> float:
     schedule_step = min(scheduler_step + 1, config.train.max_steps)
     return (
         learning_rate_at_step(config.optimizer, config.train.max_steps, schedule_step)
@@ -139,13 +186,19 @@ def scheduler_scale(config: Stage2Config, scheduler_step: int) -> float:
 
 def load_checkpoint(path: str | Path) -> dict:
     payload = torch.load(path, map_location="cpu", weights_only=False)
+    payload = normalize_stage2_checkpoint(payload)
     required = {
         "version",
+        "architecture",
         "stage",
         "step",
         "tokenizer",
         "tokenizer_checkpoint",
         "config",
+        "k",
+        "mixed_prefix",
+        "training_k_probabilities",
+        "evaluation_k",
         "model",
         "optimizer",
         "scheduler",
@@ -157,8 +210,14 @@ def load_checkpoint(path: str | Path) -> dict:
             f"Stage2 checkpoint fields are {sorted(payload)}, "
             f"expected {sorted(required)}"
         )
-    if payload["version"] != CHECKPOINT_VERSION or payload["stage"] != 2:
-        raise ValueError("Expected a version-2 Stage2 checkpoint")
+    expected_probabilities = training_k_probabilities(
+        int(payload["k"]), bool(payload["mixed_prefix"])
+    )
+    if payload["training_k_probabilities"] != expected_probabilities:
+        raise ValueError("Stage2 checkpoint training K probabilities are inconsistent")
+    config_from_checkpoint(payload)
+    if payload["stage"] != 2:
+        raise ValueError("Expected Stage2 checkpoint")
     return payload
 
 
@@ -208,7 +267,7 @@ def evaluate_checkpoint_in_subprocess(
     checkpoint_path: Path,
     evaluation_dir: Path,
     tokenizer: torch.nn.Module,
-    model: CategoricalEntropyModel,
+    model: torch.nn.Module,
     optimizer: torch.optim.Optimizer,
     *,
     rank: int,
@@ -239,7 +298,11 @@ def evaluate_checkpoint_in_subprocess(
             shard_path = evaluation_dir / "shards" / f"rank_{shard_rank:02d}.json"
             with shard_path.open("r", encoding="utf-8") as handle:
                 shards.append(json.load(handle))
-        evaluations = merge_evaluation_shards(shards)
+        evaluations = (
+            merge_smoke_evaluation_shards(shards)
+            if args.eval_smoke
+            else merge_evaluation_shards(shards)
+        )
         for dataset, evaluation in evaluations.items():
             write_json(evaluation_dir / f"{dataset}.json", evaluation)
     dist.barrier()
@@ -258,12 +321,15 @@ def evaluate_checkpoint_in_subprocess(
 
 def save_checkpoint(
     path: Path,
-    model: CategoricalEntropyModel,
+    model: torch.nn.Module,
     optimizer: torch.optim.Optimizer,
     scheduler: torch.optim.lr_scheduler.LRScheduler,
-    config: Stage2Config,
+    config: LocalGlobalMemoryStage2Config,
     tokenizer_name: str,
     tokenizer_checkpoint: Path,
+    k: int,
+    mixed_prefix: bool,
+    evaluation_k: int,
     *,
     step: int,
     stream: DistributedEpochIterator,
@@ -288,12 +354,19 @@ def save_checkpoint(
             global_batch_size=global_batch_size,
         )
         payload = {
-            "version": CHECKPOINT_VERSION,
+            "version": checkpoint_version(config.model),
+            "architecture": architecture(config.model),
             "stage": 2,
             "step": step,
             "tokenizer": tokenizer_name,
             "tokenizer_checkpoint": str(tokenizer_checkpoint),
             "config": stage2_config_dict(config),
+            "k": k,
+            "mixed_prefix": mixed_prefix,
+            "training_k_probabilities": training_k_probabilities(
+                k, mixed_prefix
+            ),
+            "evaluation_k": evaluation_k,
             "model": model.state_dict(),
             "optimizer": optimizer.state_dict(),
             "scheduler": scheduler.state_dict(),
@@ -316,7 +389,8 @@ def run(args: argparse.Namespace) -> None:
     config = load_stage2_config(args.config)
     if config.train.batch_size != 2:
         raise ValueError(
-            f"Canonical Stage2 requires batch_size=2 per GPU, got {config.train.batch_size}"
+            "Canonical 3D-window Stage2 requires batch_size=2 per GPU, "
+            f"got {config.train.batch_size}"
         )
     config_payload = stage2_config_dict(config)
     global_batch_size = config.train.batch_size * world_size
@@ -328,13 +402,7 @@ def run(args: argparse.Namespace) -> None:
 
     loaded = load_stage1_tokenizer(
         args.tokenizer_checkpoint,
-        wan_repo=args.wan_repo,
-        wan_checkpoint=args.wan_checkpoint,
-        cosmos_repo=args.cosmos_repo,
-        cosmos_encoder=args.cosmos_encoder,
-        cosmos_decoder=args.cosmos_decoder,
-        cosmos_cv888_encoder=args.cosmos_cv888_encoder,
-        cosmos_cv888_decoder=args.cosmos_cv888_decoder,
+
         minimax_h3_model_dir=args.minimax_h3_model_dir,
     )
     if config.model.codebook_dim != loaded.codebook_dim:
@@ -366,7 +434,7 @@ def run(args: argparse.Namespace) -> None:
     )
 
     tokenizer = loaded.model.to(device).eval().requires_grad_(False)
-    model = CategoricalEntropyModel(config.model).to(device)
+    model = build_model(config.model).to(device)
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=config.optimizer.learning_rate,
@@ -384,8 +452,18 @@ def run(args: argparse.Namespace) -> None:
     start_epoch = 0
     start_batch = 0
     if resume is not None:
+        if int(resume["k"]) != args.k:
+            raise ValueError("Stage2 resume K changed")
+        if bool(resume["mixed_prefix"]) != args.mixed_prefix:
+            raise ValueError("Stage2 resume mixed-prefix switch changed")
+        if resume["training_k_probabilities"] != training_k_probabilities(
+            args.k, args.mixed_prefix
+        ):
+            raise ValueError("Stage2 resume training K probabilities changed")
+        if int(resume["evaluation_k"]) != args.eval_k:
+            raise ValueError("Stage2 resume evaluation K changed")
         assert_fast_loader_resume_config(
-            resume["config"], config_payload, stage="Stage2"
+            resume["config"], config_payload, stage="Stage2 3D window"
         )
         if resume["tokenizer"] != loaded.name:
             raise ValueError("Stage2 resume tokenizer changed")
@@ -430,11 +508,15 @@ def run(args: argparse.Namespace) -> None:
     if args.stop_after_steps is not None:
         stop_step = min(stop_step, start_step + args.stop_after_steps)
 
+    training_ks = tuple(
+        training_k_probabilities(args.k, args.mixed_prefix)
+    )
     if rank == 0:
         write_json(
             output_dir / ("run_manifest.json" if resume is None else f"resume_{start_step:07d}.json"),
             {
                 "schema_version": 2,
+                "architecture": architecture(config.model),
                 "stage": 2,
                 "tokenizer": loaded.name,
                 "input_frames": loaded.input_frames,
@@ -444,6 +526,7 @@ def run(args: argparse.Namespace) -> None:
                 "tokenizer_step": loaded.step,
                 "tokenizer_frozen": True,
                 "prediction_target": "one 4096-way index per latent position",
+                "entropy_context": {"type": architecture(config.model), "k": args.k, "model": asdict(config.model), "estimated_bpp_only": True},
                 "world_size": world_size,
                 "batch_size_per_gpu": config.train.batch_size,
                 "global_batch_size": global_batch_size,
@@ -465,7 +548,9 @@ def run(args: argparse.Namespace) -> None:
     progress = IntervalProgress(
         total=stop_step,
         initial=start_step,
-        desc=f"Stage2 {loaded.name} entropy",
+        desc=(
+            f"Stage2 {loaded.name} {architecture(config.model)} entropy"
+        ),
         interval=config.train.log_interval,
     ) if rank == 0 else None
     model.train()
@@ -474,6 +559,9 @@ def run(args: argparse.Namespace) -> None:
         torch.cuda.synchronize(device)
         started = time.perf_counter()
         video = stream.next().to(device, non_blocking=True)
+        k = training_k_for_step(
+            args.k, args.mixed_prefix, config.train.seed, step
+        )
         learning_rate = optimizer.param_groups[0]["lr"]
         optimizer.zero_grad(set_to_none=True)
         with torch.no_grad(), torch.autocast(
@@ -483,7 +571,7 @@ def run(args: argparse.Namespace) -> None:
             projected = tokenizer.pre_quant(latent)
             quantized, indices, _, _ = tokenizer.quantizer(projected)
         with torch.autocast("cuda", dtype=torch.bfloat16, enabled=config.train.bf16):
-            output = ddp_model(quantized, indices)
+            output = ddp_model(quantized, indices, k=k)
         output.bits_per_index.backward()
         grad_norm = torch.nn.utils.clip_grad_norm_(
             model.parameters(), config.optimizer.grad_clip_norm
@@ -508,6 +596,7 @@ def run(args: argparse.Namespace) -> None:
             "step": step,
             "bpp": float(reduced[1]),
             "bits_per_index": float(reduced[0]),
+            "k": k,
             "latency_ms": float(latency_ms),
             "grad_norm": float(reduced[2]),
             "learning_rate": learning_rate,
@@ -542,6 +631,9 @@ def run(args: argparse.Namespace) -> None:
                 config,
                 loaded.name,
                 loaded.checkpoint,
+                args.k,
+                args.mixed_prefix,
+                args.eval_k,
                 step=step,
                 stream=stream,
                 world_size=world_size,
@@ -585,7 +677,69 @@ def run(args: argparse.Namespace) -> None:
         progress.close()
 
 
+def run_eval_shard(args: argparse.Namespace) -> None:
+    device = torch.device("cuda", 0)
+    torch.cuda.set_device(device)
+    config = load_stage2_config(args.config)
+    checkpoint = load_checkpoint(args.checkpoint)
+    if int(checkpoint["evaluation_k"]) != args.k:
+        raise ValueError("Requested eval K differs from the checkpoint evaluation K")
+    assert_fast_loader_resume_config(
+        checkpoint["config"], stage2_config_dict(config), stage="Stage2"
+    )
+    loaded = load_stage1_tokenizer(
+        checkpoint["tokenizer_checkpoint"],
+
+        minimax_h3_model_dir=args.minimax_h3_model_dir,
+    )
+    tokenizer = loaded.model.to(device).eval().requires_grad_(False)
+    enable_gaussian_tile_decode(tokenizer, loaded.name)
+    model = build_model(config.model).to(device).eval()
+    model.load_state_dict(checkpoint["model"], strict=True)
+    jobs = build_benchmark_jobs(
+        args.uvg_root, args.mcl_jcv_root, args.hevc_b_root
+    )
+    if args.eval_smoke:
+        canonical_prepare = evaluation_distributed.prepare_uvg_input
+
+        def smoke_prepare(video: torch.Tensor, tokenizer_name: str):
+            resized = torch.nn.functional.interpolate(
+                video, size=(256, 384), mode="bilinear", align_corners=False
+            )
+            return canonical_prepare(resized, tokenizer_name)
+
+        evaluation_distributed.prepare_uvg_input = smoke_prepare
+        first_by_dataset = {
+            dataset: next(job for job in jobs if job.dataset == dataset)
+            for dataset in ("uvg", "mcl_jcv", "hevc_b")
+        }
+        smoke_jobs = list(first_by_dataset.values())
+        smoke_jobs.extend(job for job in jobs if job not in smoke_jobs)
+        jobs = tuple(smoke_jobs[: args.world_size])
+    shard = evaluate_shard(
+        jobs,
+        tokenizer,
+        model,
+        loaded.name,
+        create_lpips_vgg(device),
+        create_standard_lpips(device),
+        DISTS().to(device).eval(),
+        device,
+        None,
+        k=args.k,
+        rank=args.rank,
+        world_size=args.world_size,
+    )
+    shard["checkpoint_step"] = int(checkpoint["step"])
+    shard["protocol"]["entropy_context"] = {"type": architecture(config.model), "k": args.k, "model": asdict(config.model), "estimated_bpp_only": True}
+    shard["protocol"]["tile_blend"] = gaussian_tile_blend_protocol()
+    write_json(args.output, shard)
+
+
 def main() -> None:
+    if len(sys.argv) > 1 and sys.argv[1] == "eval-shard":
+        run_eval_shard(parse_eval_args(sys.argv[2:]))
+        return
     args = parse_args()
     dist.init_process_group("nccl", timeout=timedelta(hours=6))
     try:

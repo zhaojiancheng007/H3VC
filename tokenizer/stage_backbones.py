@@ -8,9 +8,6 @@ import torch
 import torch.nn as nn
 from torch.utils.checkpoint import checkpoint
 
-from .stage1_vq import CosmosCV488Backbone, WanVAEBackbone
-from .stage1_vq_cosmos_cv888 import CosmosCV888Backbone
-
 
 @dataclass(frozen=True)
 class TokenizerSpec:
@@ -20,12 +17,7 @@ class TokenizerSpec:
     codebook_dim: int
 
 
-TOKENIZER_SPECS = {
-    "wanvae": TokenizerSpec("wanvae", 97, 16, 16),
-    "cosmos_cv488": TokenizerSpec("cosmos_cv488", 97, 16, 16),
-    "cosmos_cv888": TokenizerSpec("cosmos_cv888", 97, 16, 16),
-    "minimax_h3": TokenizerSpec("minimax_h3", 107, 24, 24),
-}
+TOKENIZER_SPECS = {"minimax_h3": TokenizerSpec("minimax_h3", 107, 24, 24)}
 
 
 def checkpoint_input_frames_match(tokenizer: str, checkpoint_frames: int) -> bool:
@@ -102,26 +94,10 @@ class MiniMaxH3Backbone(nn.Module):
 def build_backbone(
     tokenizer: str,
     *,
-    wan_repo: str | Path,
-    wan_checkpoint: str | Path,
-    cosmos_repo: str | Path,
-    cosmos_cv488_encoder: str | Path,
-    cosmos_cv488_decoder: str | Path,
-    cosmos_cv888_encoder: str | Path,
-    cosmos_cv888_decoder: str | Path,
+
     minimax_h3_model_dir: str | Path,
     minimax_h3_training_frames: int | None = None,
 ) -> nn.Module:
-    if tokenizer == "wanvae":
-        return WanVAEBackbone(wan_repo, wan_checkpoint)
-    if tokenizer == "cosmos_cv488":
-        return CosmosCV488Backbone(
-            cosmos_repo, cosmos_cv488_encoder, cosmos_cv488_decoder
-        )
-    if tokenizer == "cosmos_cv888":
-        return CosmosCV888Backbone(
-            cosmos_repo, cosmos_cv888_encoder, cosmos_cv888_decoder
-        )
     if tokenizer == "minimax_h3":
         training_frames = (
             TOKENIZER_SPECS[tokenizer].input_frames

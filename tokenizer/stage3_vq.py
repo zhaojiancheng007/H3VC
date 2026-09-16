@@ -54,7 +54,7 @@ def relaxed_quantize(
         raise ValueError(f"temperature must be positive, got {temperature}")
     if projected.ndim != 5 or projected.shape[1] != codebook.shape[1]:
         raise ValueError(
-            f"Projected/codebook shapes do not match: "
+            "Projected/codebook shapes do not match: "
             f"{tuple(projected.shape)} and {tuple(codebook.shape)}"
         )
     with torch.autocast(device_type=projected.device.type, enabled=False):
@@ -69,9 +69,9 @@ def relaxed_quantize(
         selected = selected_code_vectors(embeddings, indices)
         projected_fp32 = projected.float()
         quantized = projected_fp32 + (selected - projected_fp32).detach()
-        probabilities = torch.softmax(-squared_distances / temperature, dim=-1).reshape(
-            *indices.shape, embeddings.shape[0]
-        )
+        probabilities = torch.softmax(
+            -squared_distances / temperature, dim=-1
+        ).reshape(*indices.shape, embeddings.shape[0])
     return RelaxedQuantization(
         projected=projected_fp32,
         selected=selected,
@@ -91,7 +91,9 @@ class JointVQModel(nn.Module):
         self.tokenizer = tokenizer
         self.entropy_model = entropy_model
 
-    def forward(self, video: torch.Tensor, *, temperature: float) -> JointVQOutput:
+    def forward(
+        self, video: torch.Tensor, *, temperature: float, k: int
+    ) -> JointVQOutput:
         latent = self.tokenizer.encode(video)
         projected = self.tokenizer.pre_quant(latent)
         relaxed = relaxed_quantize(
@@ -106,6 +108,7 @@ class JointVQModel(nn.Module):
             relaxed.quantized,
             relaxed.indices,
             relaxed.target_probabilities,
+            k=k,
         )
         return JointVQOutput(
             tokenizer=JointTokenizerOutput(

@@ -5,7 +5,6 @@ from dataclasses import dataclass
 import torch
 import torch.nn.functional as F
 
-from tokenizer.cosmos_dv.preprocessing import PadInfo, pad_for_cosmos, unpad_reconstruction
 from tokenizer.stage_backbones import TOKENIZER_SPECS
 
 
@@ -18,7 +17,6 @@ class EvaluationInput:
     model_input: torch.Tensor
     model_frames: int
     rate_frames: int
-    cosmos_pad: PadInfo | None
 
 
 def uvg_metric_frames(tokenizer: str) -> int:
@@ -53,27 +51,19 @@ def prepare_uvg_input(video: torch.Tensor, tokenizer: str) -> EvaluationInput:
         )
         video = torch.cat((video, tail), dim=0)
     model_input = video.permute(1, 0, 2, 3).unsqueeze(0).mul(2.0).sub(1.0)
-    cosmos_pad = None
-    if tokenizer in {"cosmos_cv488", "cosmos_cv888"}:
-        alignment = 4 if tokenizer == "cosmos_cv488" else 8
-        model_input, cosmos_pad = pad_for_cosmos(
-            model_input, temporal_alignment=alignment, spatial_alignment=16
-        )
     if model_input.shape[2] != spec.input_frames:
         raise RuntimeError(
             f"{tokenizer} must forward {spec.input_frames} frames, "
             f"got {model_input.shape[2]}"
         )
     return EvaluationInput(
-        reference, model_input, spec.input_frames, expected_frames, cosmos_pad
+        reference, model_input, spec.input_frames, expected_frames
     )
 
 
 def finish_uvg_reconstruction(
     reconstruction: torch.Tensor, prepared: EvaluationInput
 ) -> torch.Tensor:
-    if prepared.cosmos_pad is not None:
-        reconstruction = unpad_reconstruction(reconstruction, prepared.cosmos_pad)
     if reconstruction.shape[2] != prepared.model_frames:
         raise RuntimeError(
             f"Decoder must reconstruct {prepared.model_frames} frames before "

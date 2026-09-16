@@ -13,6 +13,7 @@ import subprocess
 import sys
 import time
 
+from DISTS_pytorch import DISTS
 import numpy as np
 import torch
 import torch.distributed as dist
@@ -24,7 +25,9 @@ from torch.utils.data.distributed import DistributedSampler
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
+from metrics.lpips import create_standard_lpips
 from metrics.reporting import write_json
+from tokenizer.gaussian_tile_decode import enable_gaussian_tile_decode, gaussian_tile_blend_protocol
 from tokenizer.stage1_vq import (
     CODEBOOK_SIZE,
     QUANTIZER_GEOMETRY,
@@ -62,7 +65,11 @@ from training.distributed_runtime_fast import (
     FAST_WORKERS_PER_RANK,
     build_video_dataloader_fast as build_video_dataloader,
 )
-from training.evaluation_categorical_distributed import merge_evaluation_shards
+from training.evaluation_categorical_distributed import (
+    build_benchmark_jobs,
+    evaluate_shard,
+    merge_evaluation_shards,
+)
 from training.periodic_benchmarks import evaluation_environment
 from training.periodic_benchmarks_gaussian import (
     distributed_evaluation_command as evaluation_command,
@@ -77,9 +84,7 @@ CHECKPOINT_INTERVAL = 5000
 CHECKPOINT_VERSION = 3
 
 
-
-
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Train one raw-L2 4096-way EMA-VQ tokenizer"
     )
@@ -106,40 +111,25 @@ def parse_args() -> argparse.Namespace:
         "--hevc-b-root",
         required=True,
     )
-    parser.add_argument("--wan-repo", default=str(PROJECT_ROOT / "Wan2.1"))
-    parser.add_argument(
-        "--wan-checkpoint",
-        default=str(PROJECT_ROOT / "pretrained_ckpts/Wan2.1/Wan2.1_VAE.pth"),
-    )
-    parser.add_argument("--cosmos-repo", default=str(PROJECT_ROOT / "Cosmos-Tokenizer"))
-    parser.add_argument(
-        "--cosmos-encoder",
-        default=str(
-            PROJECT_ROOT
-            / "pretrained_ckpts/Cosmos-0.1-Tokenizer-CV4x8x8/encoder.jit"
-        ),
-    )
-    parser.add_argument(
-        "--cosmos-decoder",
-        default=str(
-            PROJECT_ROOT
-            / "pretrained_ckpts/Cosmos-0.1-Tokenizer-CV4x8x8/decoder.jit"
-        ),
-    )
-    parser.add_argument(
-        "--cosmos-cv888-encoder",
-        default=str(PROJECT_ROOT / "pretrained_ckpts/Cosmos-0.1-Tokenizer-CV8x8x8/encoder.jit"),
-    )
-    parser.add_argument(
-        "--cosmos-cv888-decoder",
-        default=str(PROJECT_ROOT / "pretrained_ckpts/Cosmos-0.1-Tokenizer-CV8x8x8/decoder.jit"),
-    )
     parser.add_argument(
         "--minimax-h3-model-dir",
         required=True,
     )
     parser.add_argument("--resume")
-    return parser.parse_args()
+    return parser.parse_args(argv)
+
+
+def parse_eval_args(argv: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Evaluate one Stage1 shard")
+    parser.add_argument("--checkpoint", required=True)
+    parser.add_argument("--output", required=True)
+    parser.add_argument("--rank", required=True, type=int)
+    parser.add_argument("--world-size", required=True, type=int)
+    parser.add_argument("--uvg-root", required=True)
+    parser.add_argument("--mcl-jcv-root", required=True)
+    parser.add_argument("--hevc-b-root", required=True)
+    parser.add_argument("--minimax-h3-model-dir", required=True)
+    return parser.parse_args(argv)
 
 
 def synchronize(device: torch.device) -> None:
@@ -421,13 +411,7 @@ def run(args: argparse.Namespace) -> None:
 
     backbone = build_backbone(
         args.tokenizer,
-        wan_repo=args.wan_repo,
-        wan_checkpoint=args.wan_checkpoint,
-        cosmos_repo=args.cosmos_repo,
-        cosmos_cv488_encoder=args.cosmos_encoder,
-        cosmos_cv488_decoder=args.cosmos_decoder,
-        cosmos_cv888_encoder=args.cosmos_cv888_encoder,
-        cosmos_cv888_decoder=args.cosmos_cv888_decoder,
+
         minimax_h3_model_dir=args.minimax_h3_model_dir,
     )
     model = Stage1VQTokenizer(
@@ -692,7 +676,42 @@ def run(args: argparse.Namespace) -> None:
         progress.close()
 
 
+def run_eval_shard(args: argparse.Namespace) -> None:
+    device = torch.device("cuda", 0)
+    torch.cuda.set_device(device)
+    loaded = load_stage1_tokenizer(
+        args.checkpoint,
+
+        minimax_h3_model_dir=args.minimax_h3_model_dir,
+    )
+    tokenizer = loaded.model.to(device).eval().requires_grad_(False)
+    enable_gaussian_tile_decode(tokenizer, loaded.name)
+    jobs = build_benchmark_jobs(
+        args.uvg_root, args.mcl_jcv_root, args.hevc_b_root
+    )
+    shard = evaluate_shard(
+        jobs,
+        tokenizer,
+        None,
+        loaded.name,
+        create_lpips_vgg(device),
+        create_standard_lpips(device),
+        DISTS().to(device).eval(),
+        device,
+        None,
+        k=None,
+        rank=args.rank,
+        world_size=args.world_size,
+    )
+    shard["checkpoint_step"] = loaded.step
+    shard["protocol"]["tile_blend"] = gaussian_tile_blend_protocol()
+    write_json(args.output, shard)
+
+
 def main() -> None:
+    if len(sys.argv) > 1 and sys.argv[1] == "eval-shard":
+        run_eval_shard(parse_eval_args(sys.argv[2:]))
+        return
     args = parse_args()
     dist.init_process_group("nccl", timeout=timedelta(hours=6))
     try:

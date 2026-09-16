@@ -18,6 +18,7 @@ class Stage3OptimizerConfig:
     tokenizer_eta_min: float
     entropy_learning_rate: float
     entropy_eta_min: float
+    weight_decay: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -88,29 +89,6 @@ def load_stage3_config(path: str | Path) -> Stage3Config:
         raise ValueError(f"Stage3 config requires exactly {sorted(expected)}")
     optimizer = dict(raw["optimizer"])
     loss = dict(raw["loss"])
-    legacy_keys = {
-        "discriminator_learning_rate",
-        "gan_start_step",
-        "gan_weight",
-    }
-    present_legacy_keys = (
-        (
-            {"discriminator_learning_rate"}
-            if "discriminator_learning_rate" in optimizer
-            else set()
-        )
-        | ({"gan_start_step"} if "gan_start_step" in loss else set())
-        | ({"gan_weight"} if "gan_weight" in loss else set())
-    )
-    if present_legacy_keys and present_legacy_keys != legacy_keys:
-        raise ValueError(
-            f"Legacy Stage3 GAN fields must appear together, got {sorted(present_legacy_keys)}"
-        )
-    if present_legacy_keys:
-        optimizer.pop("discriminator_learning_rate")
-        loss.pop("gan_start_step")
-        if float(loss.pop("gan_weight")) != 0:
-            raise ValueError("Legacy Stage3 config is compatible only when gan_weight=0")
     optimizer["betas"] = tuple(optimizer["betas"])
     config = Stage3Config(
         model=_construct(CategoricalEntropyModelConfig, dict(raw["model"])),
@@ -133,11 +111,13 @@ def load_stage3_config(path: str | Path) -> Stage3Config:
     )
     if min(positive) <= 0:
         raise ValueError(f"Stage3 values must be positive: {config}")
+    if config.optimizer.weight_decay != 0:
+        raise ValueError("Stage3 uses Adam with weight_decay=0")
     if not (
-        config.optimizer.tokenizer_learning_rate > config.optimizer.tokenizer_eta_min >= 0
-        and config.optimizer.entropy_learning_rate > config.optimizer.entropy_eta_min >= 0
+        config.optimizer.tokenizer_learning_rate >= config.optimizer.tokenizer_eta_min >= 0
+        and config.optimizer.entropy_learning_rate >= config.optimizer.entropy_eta_min >= 0
     ):
-        raise ValueError("Cosine LR requires each initial rate to exceed eta_min >= 0")
+        raise ValueError("Cosine LR requires each initial rate to be at least eta_min >= 0")
     if config.train.max_steps <= 1:
         raise ValueError("Cosine LR requires max_steps > 1")
     return config

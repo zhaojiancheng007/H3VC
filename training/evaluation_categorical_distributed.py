@@ -111,6 +111,8 @@ def evaluate_sequence_job(
     dists_metric: DISTS,
     device: torch.device,
     recon_root: Path | None,
+    *,
+    k: int | None,
 ) -> dict[str, Any]:
     source_frames = uvg_source_frames(tokenizer_name)
     video, _ = load_png_sequence(job.frames_dir, source_frames, start_frame=1)
@@ -121,18 +123,27 @@ def evaluate_sequence_job(
     with torch.autocast("cuda", dtype=torch.bfloat16):
         latent = tokenizer.encode(prepared.model_input.to(device))
         projected = tokenizer.pre_quant(latent)
-    flat = projected.permute(0, 2, 3, 4, 1).reshape(-1, projected.shape[1]).float()
+    flat = projected.permute(0, 2, 3, 4, 1).reshape(
+        -1, projected.shape[1]
+    ).float()
     flat_indices = tokenizer.quantizer._nearest_indices(flat)
     indices = flat_indices.reshape(
-        projected.shape[0], projected.shape[2], projected.shape[3], projected.shape[4]
+        projected.shape[0],
+        projected.shape[2],
+        projected.shape[3],
+        projected.shape[4],
     )
     selected = selected_code_vectors(tokenizer.quantizer.embed, indices)
     if entropy_model is None:
         bits_per_index = math.log2(tokenizer.quantizer.embed.shape[0])
         bits = float(indices.numel() * bits_per_index)
     else:
+        if k is None:
+            raise ValueError("Entropy evaluation requires an explicit K")
         with torch.autocast("cuda", dtype=torch.bfloat16):
-            bits = float(_estimated_bits(entropy_model, selected, indices).item())
+            bits = float(
+                _estimated_bits(entropy_model, selected, indices, k=k).item()
+            )
     with torch.autocast("cuda", dtype=torch.bfloat16):
         reconstruction = tokenizer.decode(
             tokenizer.post_quant(selected.to(projected.dtype))
@@ -142,9 +153,7 @@ def evaluate_sequence_job(
 
     reconstruction = finish_uvg_reconstruction(reconstruction, prepared)
     if recon_root is not None:
-        save_reconstruction(
-            reconstruction, recon_root / job.dataset / job.sequence
-        )
+        save_reconstruction(reconstruction, recon_root / job.dataset / job.sequence)
     reference = prepared.reference
     difference = reference - reconstruction
     squared_error = float(difference.square().sum().item())
@@ -188,6 +197,7 @@ def evaluate_shard(
     device: torch.device,
     recon_root: Path | None,
     *,
+    k: int | None,
     rank: int,
     world_size: int,
 ) -> dict[str, Any]:
@@ -202,6 +212,7 @@ def evaluate_shard(
             dists_metric,
             device,
             recon_root,
+            k=k,
         )
         for job in shard_jobs(jobs, rank, world_size)
     ]
@@ -220,6 +231,7 @@ def evaluate_shard(
                 if entropy_model is None
                 else "estimated categorical cross-entropy bits"
             ),
+            "entropy_k": k,
         },
         "sequences": reports,
     }
@@ -303,8 +315,9 @@ def merge_evaluation_shards(
     world_size = world_sizes.pop()
     ranks = {int(shard["rank"]) for shard in shards}
     if ranks != set(range(world_size)):
-        raise ValueError(f"Expected shard ranks 0..{world_size - 1}, got {sorted(ranks)}")
-
+        raise ValueError(
+            f"Expected shard ranks 0..{world_size - 1}, got {sorted(ranks)}"
+        )
     tokenizers = {str(shard["tokenizer"]) for shard in shards}
     if len(tokenizers) != 1:
         raise ValueError(f"Evaluation shards disagree on tokenizer: {tokenizers}")
@@ -334,7 +347,9 @@ def merge_evaluation_shards(
     if set(by_identity) != expected:
         missing = sorted(expected - set(by_identity))
         extra = sorted(set(by_identity) - expected)
-        raise ValueError(f"Evaluation shard coverage changed: missing={missing}, extra={extra}")
+        raise ValueError(
+            f"Evaluation shard coverage changed: missing={missing}, extra={extra}"
+        )
 
     outputs = {}
     for dataset in ("uvg", "mcl_jcv", "hevc_b"):
