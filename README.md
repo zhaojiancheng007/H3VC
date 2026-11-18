@@ -15,3 +15,9 @@ CUDA_VISIBLE_DEVICES=0 python scripts/inference.py \
 | `--checkpoint` | H3VC Stage3 checkpoint |
 | `--frames-dir` | 96 RGB PNG frames: `000001.png`–`000096.png` |
 | `--output-dir` | New directory for reconstruction PNGs and `metrics.json` (PSNR, estimated bpp, latency) |
+
+## TODO
+
+- [x] Release inference code
+- [ ] Release checkpoint
+- [ ] Release training code
