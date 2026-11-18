@@ -1,3 +1,5 @@
+# H3VC adapter for MiniMax-H3: https://huggingface.co/MiniMaxAI/MiniMax-H3/tree/main/FL2VA/video_vae
+# Upstream VAE license: Apache-2.0; see h3/LICENSE.
 """MiniMax-H3 construction and inference; weights come from H3VC."""
 from torch import nn
 from .h3.klvae import AutoencoderKLLegacy

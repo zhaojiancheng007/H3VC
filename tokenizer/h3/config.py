@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: Apache-2.0
+# MiniMax-H3 source: https://huggingface.co/MiniMaxAI/MiniMax-H3/tree/main/FL2VA/video_vae
+# License: Apache-2.0; see LICENSE in this directory.
+# Adapted from the upstream config.json and source/config.json.
 # MiniMax-H3 architecture and the original inference tile settings.
 H3_CONFIG = {'causal_decoder': False,
  'causal_encoder': True,

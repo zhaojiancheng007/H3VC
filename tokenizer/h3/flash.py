@@ -1,4 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
+# MiniMax-H3 source: https://huggingface.co/MiniMaxAI/MiniMax-H3/tree/main/FL2VA/video_vae
+# License: Apache-2.0; see LICENSE in this directory.
 # Torch-native attention implemented with PyTorch SDPA instead of FA4/CUTLASS.
 import os
 from contextlib import nullcontext
