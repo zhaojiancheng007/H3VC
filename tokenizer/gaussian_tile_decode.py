@@ -6,7 +6,7 @@ from types import MethodType
 import torch
 
 
-GAUSSIAN_VARIANCE = 0.01
+GAUSSIAN_VARIANCE = 0.04
 
 
 def gaussian_tile_weight(
@@ -48,11 +48,8 @@ def gaussian_tiled_decode(self, z: torch.Tensor) -> torch.Tensor:
             placements.append((i_pos, j_pos))
 
     tile_indices = list(range(len(tiles)))
-    stack_tiling = self.stack_tiling and not (
-        self.training and getattr(self.decoder, "mask_enabled", False)
-    )
     decoded_tiles = self._run_tile_tasks(
-        tiles, tile_indices, self.decode, stack_tiling
+        tiles, tile_indices, self.decode, self.stack_tiling
     )
     if len(decoded_tiles) != len(placements):
         raise RuntimeError(
@@ -96,11 +93,7 @@ def gaussian_tiled_decode(self, z: torch.Tensor) -> torch.Tensor:
     return (accumulator / normalizer).to(first.dtype)
 
 
-def enable_gaussian_tile_decode(tokenizer: torch.nn.Module, tokenizer_name: str) -> None:
-    if tokenizer_name != "minimax_h3":
-        raise ValueError(
-            f"Gaussian tile evaluation requires minimax_h3, got {tokenizer_name}"
-        )
+def enable_gaussian_tile_decode(tokenizer: torch.nn.Module) -> None:
     vae = tokenizer.backbone.model
     vae.tiled_decode = MethodType(gaussian_tiled_decode, vae)
 

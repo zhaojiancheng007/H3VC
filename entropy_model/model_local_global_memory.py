@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-import math
 
 import torch
 from torch import nn
@@ -11,19 +9,6 @@ from .config_categorical import CategoricalEntropyModelConfig
 from .config_local_global_memory import LocalGlobalMemoryEntropyConfig
 from .layout import BlockTensor, SpatiotemporalWindowLayout
 from .model_categorical import CategoricalEntropyModel
-
-
-@dataclass(frozen=True)
-class LocalGlobalMemoryEntropyOutput:
-    logits: torch.Tensor
-    estimated_bits: torch.Tensor
-    bits_per_index: torch.Tensor
-
-
-@dataclass(frozen=True)
-class LocalGlobalMemoryState:
-    memory: torch.Tensor
-    local_history: torch.Tensor | None
 
 
 class SwiGLU(nn.Module):
@@ -154,35 +139,3 @@ class LocalGlobalMemoryEntropyModel(CategoricalEntropyModel):
         global_context = self.read_all_global(self.memory_banks(summaries))
         hidden = self._fuse_global(hidden, blocks, layout, global_context)
         return self.output_head(self.output_norm(hidden)), blocks
-
-    def forward(self, quantized: torch.Tensor, indices: torch.Tensor, *, k: int = 1) -> LocalGlobalMemoryEntropyOutput:
-        self._validate(quantized, indices)
-        logits, blocks = self.predict(quantized, k=k)
-        targets = self._targets(indices, k=k)
-        bits = F.cross_entropy(logits.float().reshape(-1, self.config.codebook_size), targets.reshape(-1), reduction="none").reshape(targets.shape) / math.log(2.0)
-        estimated_bits = bits.sum(dim=(-1, -2)).reshape(indices.shape[0], blocks.num_windows).sum(dim=1)
-        return LocalGlobalMemoryEntropyOutput(logits=logits, estimated_bits=estimated_bits, bits_per_index=estimated_bits.sum() / indices.numel())
-
-    def init_state(self, batch_size: int, *, device: torch.device, dtype: torch.dtype) -> LocalGlobalMemoryState:
-        memory = self.initial_memory.to(device=device, dtype=dtype).unsqueeze(0).expand(batch_size, -1, -1).clone()
-        return LocalGlobalMemoryState(memory=memory, local_history=None)
-
-    def predict_rank(self, state: LocalGlobalMemoryState, decoded_frame: torch.Tensor, *, rank: int) -> torch.Tensor:
-        if rank not in range(4):
-            raise ValueError(f"rank must be in [0,4), got {rank}")
-        frame = decoded_frame.unsqueeze(2)
-        sequence = frame if state.local_history is None else torch.cat((state.local_history, frame), dim=2)
-        logits, blocks = self.predict(sequence, k=1)
-        current_rank = (sequence.shape[2] - 1) * 4 + rank
-        return logits[:, current_rank].reshape(sequence.shape[0], blocks.num_windows, logits.shape[2], logits.shape[3])
-
-    def update_state(self, state: LocalGlobalMemoryState, decoded_frame: torch.Tensor) -> LocalGlobalMemoryState:
-        vectors = self._frame_vectors(decoded_frame.unsqueeze(2))
-        summary = self.summarize_frames(vectors)[:, 0]
-        memory = torch.cat((state.memory[:, self.config.summary_tokens:], summary), dim=1)
-        frame = decoded_frame.unsqueeze(2)
-        history = frame if state.local_history is None else torch.cat((state.local_history, frame), dim=2)
-        return LocalGlobalMemoryState(memory=memory, local_history=history[:, :, -self.config.max_latent_frames:])
-
-
-__all__ = ["LocalGlobalMemoryEntropyModel", "LocalGlobalMemoryEntropyOutput", "LocalGlobalMemoryState"]

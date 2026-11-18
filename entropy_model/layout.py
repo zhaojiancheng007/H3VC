@@ -25,41 +25,6 @@ class BlockTensor:
         return self.latent_frames * 4
 
 
-MIXED_PREFIX_K_PROBABILITIES = {1: 1.0 / 6.0, 2: 1.0 / 6.0, 3: 1.0 / 6.0, 4: 0.5}
-
-
-def training_k_probabilities(fixed_k: int, mixed_prefix: bool) -> dict[int, float]:
-    if fixed_k not in {1, 2, 3, 4}:
-        raise ValueError(f"fixed_k must be one of 1, 2, 3, 4, got {fixed_k}")
-    if mixed_prefix:
-        return dict(MIXED_PREFIX_K_PROBABILITIES)
-    return {fixed_k: 1.0}
-
-
-def training_k_for_step(
-    fixed_k: int, mixed_prefix: bool, seed: int, step: int
-) -> int:
-    if fixed_k not in {1, 2, 3, 4}:
-        raise ValueError(f"fixed_k must be one of 1, 2, 3, 4, got {fixed_k}")
-    if step <= 0:
-        raise ValueError(f"step must be positive, got {step}")
-    if not mixed_prefix:
-        return fixed_k
-
-    value = (seed + step * 0x9E3779B97F4A7C15) & ((1 << 64) - 1)
-    value = (value ^ (value >> 30)) * 0xBF58476D1CE4E5B9 & ((1 << 64) - 1)
-    value = (value ^ (value >> 27)) * 0x94D049BB133111EB & ((1 << 64) - 1)
-    value ^= value >> 31
-    uniform = (value >> 11) / float(1 << 53)
-    if uniform < 1.0 / 6.0:
-        return 1
-    if uniform < 2.0 / 6.0:
-        return 2
-    if uniform < 3.0 / 6.0:
-        return 3
-    return 4
-
-
 class SpatiotemporalWindowLayout:
     """Maps same-position 8x8 windows to one diagonal causal rank sequence."""
 
@@ -182,49 +147,6 @@ class SpatiotemporalWindowLayout:
             temporal_window_size=self.temporal_window_size,
         )
 
-    def from_blocks(self, blocks: BlockTensor) -> torch.Tensor:
-        if blocks.temporal_window_size != self.temporal_window_size:
-            raise ValueError("Block metadata uses a different temporal window size")
-        expected = (
-            blocks.batch_size * blocks.num_windows,
-            blocks.ranks_per_window,
-            self.sites_per_block,
-        )
-        if blocks.values.ndim != 4 or tuple(blocks.values.shape[:3]) != expected:
-            raise ValueError(
-                f"Expected block prefix {expected}, got {tuple(blocks.values.shape)}"
-            )
-        channels = int(blocks.values.shape[-1])
-        grouped = blocks.values.reshape(
-            blocks.batch_size,
-            blocks.windows_y,
-            blocks.windows_x,
-            blocks.latent_frames * self.window_size**2,
-            channels,
-        )
-        flat_order = self._flat_order(blocks.latent_frames)
-        inverse = [0] * len(flat_order)
-        for grouped_index, flat_index in enumerate(flat_order):
-            inverse[flat_index] = grouped_index
-        inverse_tensor = torch.tensor(
-            inverse, dtype=torch.long, device=blocks.values.device
-        )
-        flat = grouped[..., inverse_tensor, :].reshape(
-            blocks.batch_size,
-            blocks.windows_y,
-            blocks.windows_x,
-            blocks.latent_frames,
-            self.window_size,
-            self.window_size,
-            channels,
-        )
-        return flat.permute(0, 3, 1, 4, 2, 5, 6).reshape(
-            blocks.batch_size,
-            blocks.latent_frames,
-            blocks.height,
-            blocks.width,
-            channels,
-        )
 
     def coordinates(
         self, latent_frames: int, *, device: torch.device
@@ -242,12 +164,3 @@ class SpatiotemporalWindowLayout:
         time = time[:, None].expand(-1, self.sites_per_block)
         group = group[:, None].expand(-1, self.sites_per_block)
         return time, group, local_y, local_x
-
-
-__all__ = [
-    "BlockTensor",
-    "MIXED_PREFIX_K_PROBABILITIES",
-    "SpatiotemporalWindowLayout",
-    "training_k_probabilities",
-    "training_k_for_step",
-]

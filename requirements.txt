@@ -2,10 +2,7 @@ torch==2.5.1
 torchvision==0.20.1
 numpy==1.26.4
 Pillow>=10
-PyYAML>=6
 opencv-python-headless==4.10.0.84
-lpips==0.1.4
-DISTS-pytorch==0.1
 einops==0.7.0
 diffusers==0.39.0
 transformers==4.49.0

@@ -1,16 +1,9 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 
 import torch
 from torch import nn
 import torch.nn.functional as F
-
-
-@dataclass(frozen=True)
-class LayerKVCache:
-    key: torch.Tensor
-    value: torch.Tensor
 
 
 class BlockCausalSelfAttention(nn.Module):
@@ -38,21 +31,6 @@ class BlockCausalSelfAttention(nn.Module):
         attended = attended.transpose(1, 2).reshape(x.shape)
         return self.output(attended)
 
-    def forward_step(
-        self, x: torch.Tensor, cache: LayerKVCache | None
-    ) -> tuple[torch.Tensor, LayerKVCache]:
-        query, current_key, current_value = self._qkv(x)
-        if cache is None:
-            key, value = current_key, current_value
-        else:
-            key = torch.cat((cache.key, current_key), dim=2)
-            value = torch.cat((cache.value, current_value), dim=2)
-        attended = F.scaled_dot_product_attention(
-            query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False
-        )
-        attended = attended.transpose(1, 2).reshape(x.shape)
-        return self.output(attended), LayerKVCache(key, value)
-
 
 class SwiGLU(nn.Module):
     def __init__(self, d_model: int, hidden_dim: int) -> None:
@@ -76,13 +54,6 @@ class TransformerBlock(nn.Module):
     def forward(self, x: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
         x = x + self.attention(self.attention_norm(x), attention_mask)
         return x + self.ffn(self.ffn_norm(x))
-
-    def forward_step(
-        self, x: torch.Tensor, cache: LayerKVCache | None
-    ) -> tuple[torch.Tensor, LayerKVCache]:
-        attended, cache = self.attention.forward_step(self.attention_norm(x), cache)
-        x = x + attended
-        return x + self.ffn(self.ffn_norm(x)), cache
 
 
 class BlockCausalTransformer(nn.Module):
@@ -121,22 +92,3 @@ class BlockCausalTransformer(nn.Module):
         for layer in self.layers:
             flat = layer(flat, mask)
         return flat.reshape(batch, num_blocks, block_sites, channels)
-
-    def forward_step(
-        self,
-        x: torch.Tensor,
-        cache: tuple[LayerKVCache | None, ...] | None,
-    ) -> tuple[torch.Tensor, tuple[LayerKVCache, ...]]:
-        if x.ndim != 3:
-            raise ValueError(f"Expected current block [B,M,D], got {tuple(x.shape)}")
-        if cache is None:
-            layer_caches: tuple[LayerKVCache | None, ...] = (None,) * len(self.layers)
-        else:
-            if len(cache) != len(self.layers):
-                raise ValueError(f"Expected {len(self.layers)} layer caches, got {len(cache)}")
-            layer_caches = cache
-        updated: list[LayerKVCache] = []
-        for layer, layer_cache in zip(self.layers, layer_caches, strict=True):
-            x, new_cache = layer.forward_step(x, layer_cache)
-            updated.append(new_cache)
-        return x, tuple(updated)

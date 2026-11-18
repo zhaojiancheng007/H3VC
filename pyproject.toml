@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "h3vc"
-version = "0.1.0"
-description = "Three-stage H3VC training and reconstruction with estimated entropy rate"
+version = "0.2.0"
+description = "H3VC reconstruction inference with estimated entropy rate"
 readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "MIT"}
@@ -15,7 +15,7 @@ dynamic = ["dependencies"]
 dependencies = {file = ["requirements.txt"]}
 
 [tool.setuptools.packages.find]
-include = ["datasets*", "entropy_model*", "metrics*", "tokenizer*", "training*", "scripts*"]
+include = ["entropy_model*", "tokenizer*", "inference*", "scripts*"]
 
 [tool.pytest.ini_options]
 pythonpath = ["."]

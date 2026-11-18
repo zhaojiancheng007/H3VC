@@ -1,51 +1,41 @@
-"""Reconstruct one 96-frame PNG sequence and report estimated rate."""
-from __future__ import annotations
-
+"""Reconstruct the first 96 RGB PNG frames and report estimated bpp."""
 import argparse
+import json
 from pathlib import Path
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-
-from scripts.evaluate import load_model
-from DISTS_pytorch import DISTS
-from metrics.lpips import create_standard_lpips
-from metrics.reporting import write_json
-from training.video_losses import create_lpips_vgg
-from training.evaluation_categorical_distributed_codebook import (
-    SequenceJob, evaluate_sequence_job,
-)
+from inference.checkpoint import load_model
+from inference.reconstruction import reconstruct
 from tokenizer.gaussian_tile_decode import gaussian_tile_blend_protocol
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--checkpoint', required=True)
-    parser.add_argument('--tokenizer-checkpoint', required=True)
-    parser.add_argument('--entropy-checkpoint', required=True)
-    parser.add_argument('--minimax-h3-model-dir', required=True)
-    parser.add_argument('--frames-dir', required=True, type=Path)
-    parser.add_argument('--output-dir', required=True, type=Path)
+    parser.add_argument("--checkpoint", required=True, help="Trusted Stage3 checkpoint")
+    parser.add_argument("--entropy-checkpoint", required=True, help="Matching Stage2 checkpoint (architecture metadata)")
+    parser.add_argument("--minimax-h3-model-dir", required=True, help="External MiniMax-H3 video_vae directory")
+    parser.add_argument("--frames-dir", type=Path, required=True, help="RGB PNGs numbered 000001.png through 000096.png")
+    parser.add_argument("--output-dir", type=Path, required=True, help="New output directory")
     args = parser.parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=False)
-    model, loaded, step, architecture, device = load_model(args)
-    report = evaluate_sequence_job(
-        SequenceJob('input', args.frames_dir.name, args.frames_dir),
-        model.tokenizer, model.entropy_model, loaded.name,
-        create_lpips_vgg(device), create_standard_lpips(device),
-        DISTS().to(device).eval(), device, args.output_dir / 'recon', k=1,
-    )
-    report['checkpoint_step'] = step
-    report['estimated_bits_per_token'] = report['bits'] / report['codebook']['total_assignments']
-    report['protocol'] = {
-        'rate': 'estimated categorical cross-entropy bits; not an encoded bitstream',
-        'metric_frames': 96, 'model_input_frames': 107, 'bpp_denominator_frames': 96,
-        'entropy_k': 1, 'entropy_architecture': architecture,
-        'tile_blend': gaussian_tile_blend_protocol(),
+    model, step, architecture, device = load_model(args)
+    report = reconstruct(args.frames_dir, model.tokenizer, model.entropy_model,
+                         device, args.output_dir / "recon")
+    report["checkpoint_step"] = step
+    report["estimated_bits_per_token"] = report["bits"] / report["codebook"]["total_assignments"]
+    report["protocol"] = {
+        "rate": "estimated categorical cross-entropy; not an encoded bitstream",
+        "precision": "BF16 autocast; FP32 quantization and cross-entropy",
+        "metric_frames": 96, "model_input_frames": 107, "bpp_denominator_frames": 96,
+        "entropy_k": 1, "entropy_architecture": architecture,
+        "tile_blend": gaussian_tile_blend_protocol(),
+        "latency_scope": "encode + VQ + entropy estimation + decode; excludes model loading, metrics and PNG IO",
+        "latency_unit": "ms per source frame; single run, not a benchmark",
     }
-    write_json(args.output_dir / 'metrics.json', report)
-    print(args.output_dir / 'metrics.json')
+    (args.output_dir / "metrics.json").write_text(json.dumps(report, indent=2) + "\n")
+    print(f"Saved reconstructions and metrics to {args.output_dir}")
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

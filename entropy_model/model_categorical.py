@@ -1,30 +1,12 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-import math
 
 import torch
 from torch import nn
-import torch.nn.functional as F
 
 from .config_categorical import CategoricalEntropyModelConfig
 from .layout import BlockTensor, SpatiotemporalWindowLayout
 from .transformer import BlockCausalTransformer
-
-
-@dataclass(frozen=True)
-class CategoricalEntropyOutput:
-    logits: torch.Tensor
-    estimated_bits: torch.Tensor
-    bits_per_index: torch.Tensor
-
-
-@dataclass(frozen=True)
-class SoftCategoricalEntropyOutput:
-    soft_estimated_bits: torch.Tensor
-    hard_estimated_bits: torch.Tensor
-    soft_bits_per_index: torch.Tensor
-    hard_bits_per_index: torch.Tensor
 
 
 class CategoricalEntropyModel(nn.Module):
@@ -59,28 +41,6 @@ class CategoricalEntropyModel(nn.Module):
     def layout(self, k: int) -> SpatiotemporalWindowLayout:
         return SpatiotemporalWindowLayout(self.config.window_size, k)
 
-    def _validate(self, quantized: torch.Tensor, indices: torch.Tensor) -> None:
-        if quantized.ndim != 5 or quantized.shape[1] != self.config.codebook_dim:
-            raise ValueError(
-                f"Expected quantized [B,{self.config.codebook_dim},T,H,W], "
-                f"got {tuple(quantized.shape)}"
-            )
-        expected = (
-            quantized.shape[0],
-            quantized.shape[2],
-            quantized.shape[3],
-            quantized.shape[4],
-        )
-        if indices.dtype != torch.int64 or tuple(indices.shape) != expected:
-            raise ValueError(
-                f"Expected int64 indices {expected}, got "
-                f"{indices.dtype} {tuple(indices.shape)}"
-            )
-        if quantized.shape[2] > self.config.max_latent_frames:
-            raise ValueError(
-                f"latent_frames={quantized.shape[2]} exceeds "
-                f"max_latent_frames={self.config.max_latent_frames}"
-            )
 
     def _position_embeddings(
         self,
@@ -120,27 +80,6 @@ class CategoricalEntropyModel(nn.Module):
         target, source = self._position_embeddings(blocks, layout, projected.dtype)
         return inputs + target.unsqueeze(0) + source.unsqueeze(0)
 
-    def step_inputs(
-        self,
-        blocks: BlockTensor,
-        rank: int,
-        previous_vectors: torch.Tensor | None,
-    ) -> torch.Tensor:
-        layout = self.layout(blocks.temporal_window_size)
-        if rank < 0 or rank >= blocks.ranks_per_window:
-            raise ValueError(
-                f"rank must be in [0,{blocks.ranks_per_window}), got {rank}"
-            )
-        if rank == 0:
-            if previous_vectors is not None:
-                raise ValueError("rank zero must use BOS, not previous vectors")
-            inputs = self.bos.expand(blocks.values.shape[0], -1, -1)
-        else:
-            if previous_vectors is None:
-                raise ValueError("nonzero rank requires previous vectors")
-            inputs = self.code_projection(previous_vectors)
-        target, source = self._position_embeddings(blocks, layout, inputs.dtype)
-        return inputs + target[rank] + source[rank]
 
     def predict(
         self, quantized: torch.Tensor, *, k: int
@@ -154,74 +93,3 @@ class CategoricalEntropyModel(nn.Module):
             self._shifted_inputs(blocks, layout), layout.sites_per_block
         )
         return self.output_head(self.output_norm(hidden)), blocks
-
-    def _targets(self, indices: torch.Tensor, *, k: int) -> torch.Tensor:
-        return self.layout(k).to_blocks(indices.unsqueeze(-1)).values.squeeze(-1)
-
-    def forward(
-        self, quantized: torch.Tensor, indices: torch.Tensor, *, k: int
-    ) -> CategoricalEntropyOutput:
-        self._validate(quantized, indices)
-        logits, blocks = self.predict(quantized, k=k)
-        targets = self._targets(indices, k=k)
-        bits = F.cross_entropy(
-            logits.float().reshape(-1, self.config.codebook_size),
-            targets.reshape(-1),
-            reduction="none",
-        ).reshape(targets.shape) / math.log(2.0)
-        estimated_bits = bits.sum(dim=(-1, -2)).reshape(
-            indices.shape[0], blocks.num_windows
-        ).sum(dim=1)
-        return CategoricalEntropyOutput(
-            logits=logits,
-            estimated_bits=estimated_bits,
-            bits_per_index=estimated_bits.sum() / indices.numel(),
-        )
-
-    def forward_soft(
-        self,
-        quantized: torch.Tensor,
-        indices: torch.Tensor,
-        target_probabilities: torch.Tensor,
-        *,
-        k: int,
-    ) -> SoftCategoricalEntropyOutput:
-        self._validate(quantized, indices)
-        expected = (*indices.shape, self.config.codebook_size)
-        if tuple(target_probabilities.shape) != expected:
-            raise ValueError(
-                f"Expected target probabilities {expected}, "
-                f"got {tuple(target_probabilities.shape)}"
-            )
-        logits, blocks = self.predict(quantized, k=k)
-        targets = self._targets(indices, k=k)
-        with torch.autocast(device_type=logits.device.type, enabled=False):
-            probability_blocks = self.layout(k).to_blocks(
-                target_probabilities.float()
-            ).values
-            log2_probabilities = (
-                torch.log_softmax(logits.float(), dim=-1) / math.log(2.0)
-            )
-            soft_bits = -(probability_blocks * log2_probabilities).sum(dim=-1)
-            hard_bits = -log2_probabilities.gather(
-                -1, targets.unsqueeze(-1)
-            ).squeeze(-1)
-            soft_estimated_bits = soft_bits.sum(dim=(-1, -2)).reshape(
-                indices.shape[0], blocks.num_windows
-            ).sum(dim=1)
-            hard_estimated_bits = hard_bits.sum(dim=(-1, -2)).reshape(
-                indices.shape[0], blocks.num_windows
-            ).sum(dim=1)
-        return SoftCategoricalEntropyOutput(
-            soft_estimated_bits=soft_estimated_bits,
-            hard_estimated_bits=hard_estimated_bits,
-            soft_bits_per_index=soft_estimated_bits.sum() / indices.numel(),
-            hard_bits_per_index=hard_estimated_bits.sum() / indices.numel(),
-        )
-
-
-__all__ = [
-    "CategoricalEntropyOutput",
-    "SoftCategoricalEntropyOutput",
-    "CategoricalEntropyModel",
-]
