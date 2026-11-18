@@ -20,11 +20,8 @@ def build_model(config):
 
 
 def config_from_checkpoint(payload):
-    if payload["version"] == 2 and payload["stage"] == 2 and "architecture" not in payload:
-        return CategoricalEntropyModelConfig(**payload["config"]["model"])
-    pair = (payload["architecture"], payload["version"])
-    if pair == (GLOBAL_LOCAL, 1):
-        return LocalGlobalMemoryEntropyConfig(**payload["config"]["model"])
-    if pair == (LOCAL, 13):
-        return CategoricalEntropyModelConfig(**payload["config"]["model"])
-    raise ValueError(f"Unsupported entropy checkpoint architecture/version: {pair}")
+    # The global-memory parameter is present only in the Global-local architecture.
+    config_type = (LocalGlobalMemoryEntropyConfig
+                   if "entropy_model.initial_memory" in payload["model"]
+                   else CategoricalEntropyModelConfig)
+    return config_type(**payload["config"]["model"])

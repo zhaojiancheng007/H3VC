@@ -3,6 +3,7 @@ import argparse
 import json
 from pathlib import Path
 import sys
+import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from inference.checkpoint import load_model
@@ -13,13 +14,12 @@ from tokenizer.gaussian_tile_decode import gaussian_tile_blend_protocol
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint", required=True, help="Trusted Stage3 checkpoint")
-    parser.add_argument("--entropy-checkpoint", required=True, help="Matching Stage2 checkpoint (architecture metadata)")
-    parser.add_argument("--minimax-h3-model-dir", required=True, help="External MiniMax-H3 video_vae directory")
     parser.add_argument("--frames-dir", type=Path, required=True, help="RGB PNGs numbered 000001.png through 000096.png")
     parser.add_argument("--output-dir", type=Path, required=True, help="New output directory")
     args = parser.parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=False)
-    model, step, architecture, device = load_model(args)
+    device = torch.device("cuda", 0)
+    model, step, architecture = load_model(args.checkpoint, device)
     report = reconstruct(args.frames_dir, model.tokenizer, model.entropy_model,
                          device, args.output_dir / "recon")
     report["checkpoint_step"] = step

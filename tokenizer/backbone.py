@@ -1,17 +1,19 @@
-"""Original MiniMax-H3 encode/decode path for 107-frame inference."""
-from pathlib import Path
-import sys
-import torch
+"""MiniMax-H3 construction and inference; weights come from H3VC."""
 from torch import nn
+from .h3.klvae import AutoencoderKLLegacy
+from .h3.parallel import get_parallel_state
+from .h3.config import H3_CONFIG
 
 
 class MiniMaxH3Backbone(nn.Module):
-    def __init__(self, model_dir):
+    def __init__(self):
         super().__init__()
-        model_dir = Path(model_dir).resolve()
-        sys.path.insert(0, str(model_dir.parent))
-        from video_vae.minimax_h3_video_vae import MiniMaxH3VideoVAE
-        self.model = MiniMaxH3VideoVAE.from_pretrained(str(model_dir)).model
+        get_parallel_state().update(
+            group_size=1, group_rank=0, local_process_group=None,
+            sp_size=1, sp_rank=0, sp_enabled=False, sp_process_group=None,
+            tp_size=1, tp_rank=0,
+        )
+        self.model = AutoencoderKLLegacy(**H3_CONFIG)
 
     def encode(self, video):
         pixels = video.float().add(1.0).div(2.0)

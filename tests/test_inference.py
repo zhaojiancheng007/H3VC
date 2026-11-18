@@ -47,3 +47,29 @@ def test_missing_frame_fails(tmp_path):
     save_reconstruction(torch.zeros(1, 3, 4, 4), tmp_path / 'frames')
     with pytest.raises(FileNotFoundError):
         load_png_sequence(tmp_path / 'frames')
+
+
+@pytest.mark.parametrize('global_local', [False, True])
+def test_stage3_supplies_entropy_config_and_weights(global_local):
+    from dataclasses import asdict
+    from entropy_model.config_local_global_memory import LocalGlobalMemoryEntropyConfig
+    from entropy_model.selection import config_from_checkpoint, build_model
+
+    config_type = LocalGlobalMemoryEntropyConfig if global_local else CategoricalEntropyModelConfig
+    original_config = config_type(codebook_dim=24, d_model=32, num_layers=1,
+                                  num_heads=4, ffn_dim=64, max_latent_frames=2)
+    original = build_model(original_config).eval()
+    shared = asdict(CategoricalEntropyModelConfig(codebook_dim=24, d_model=32,
+                    num_layers=1, num_heads=4, ffn_dim=64, max_latent_frames=2))
+    payload = {'config': {'model': shared},
+               'model': {'entropy_model.' + k: v for k, v in original.state_dict().items()}}
+    config = config_from_checkpoint(payload)
+    assert type(config) is config_type
+    restored = build_model(config).eval()
+    restored.load_state_dict({k.removeprefix('entropy_model.'): v
+                             for k, v in payload['model'].items()}, strict=True)
+    x = torch.randn(1, 24, 2, 8, 8)
+    with torch.inference_mode():
+        expected, _ = original.predict(x, k=1)
+        actual, _ = restored.predict(x, k=1)
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
