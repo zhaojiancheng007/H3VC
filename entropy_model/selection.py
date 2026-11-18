@@ -28,4 +28,3 @@ def config_from_checkpoint(payload):
     if pair == (LOCAL, 13):
         return CategoricalEntropyModelConfig(**payload["config"]["model"])
     raise ValueError(f"Unsupported entropy checkpoint architecture/version: {pair}")
-

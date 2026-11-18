@@ -95,9 +95,3 @@ def test_local_forward_is_exactly_the_canonical_model() -> None:
         expected, _ = canonical.predict(quantized, k=1)
         actual, _ = model.predict(quantized, k=1)
     torch.testing.assert_close(actual, expected, atol=0.0, rtol=0.0)
-
-
-
-
-
-

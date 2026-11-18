@@ -77,7 +77,7 @@ bitstream coding latency. PNG or playback-video size does not represent H3VC bpp
 - `entropy_model/`: Local-only and Global-local implementations.
 
 The inference runtime has no dependency on training scripts or the research
-repository. The original model module names are retained for checkpoint
+repository. The original parameter namespaces are retained for checkpoint
 compatibility. CPU regression tests require `pytest`:
 
 ```bash
