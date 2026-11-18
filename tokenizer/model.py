@@ -8,11 +8,6 @@ class Codebook(nn.Module):
         super().__init__()
         self.chunk_size = 4096
         self.register_buffer("embed", torch.zeros(size, dim))
-        # Retain checkpoint buffers; inference never updates them.
-        self.register_buffer("cluster_size", torch.ones(size))
-        self.register_buffer("embed_sum", torch.zeros(size, dim))
-        self.register_buffer("initted", torch.tensor(False))
-        self.register_buffer("num_updates", torch.zeros((), dtype=torch.long))
 
     def _nearest_indices(self, inputs: torch.Tensor) -> torch.Tensor:
         indices = torch.empty(inputs.shape[0], device=inputs.device, dtype=torch.long)

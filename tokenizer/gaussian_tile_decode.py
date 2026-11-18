@@ -96,11 +96,3 @@ def gaussian_tiled_decode(self, z: torch.Tensor) -> torch.Tensor:
 def enable_gaussian_tile_decode(tokenizer: torch.nn.Module) -> None:
     vae = tokenizer.backbone.model
     vae.tiled_decode = MethodType(gaussian_tiled_decode, vae)
-
-
-def gaussian_tile_blend_protocol() -> dict:
-    return {
-        "type": "gaussian",
-        "gaussian_variance": GAUSSIAN_VARIANCE,
-        "scope": "decoder_spatial_tiles",
-    }

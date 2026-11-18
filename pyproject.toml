@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "h3vc"
 version = "0.3.0"
-description = "H3VC reconstruction inference with estimated entropy rate"
+description = "H3VC video reconstruction inference"
 readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "MIT"}

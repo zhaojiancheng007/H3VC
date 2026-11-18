@@ -9,7 +9,7 @@ from entropy_model.model_categorical import CategoricalEntropyModel
 import inference.checkpoint
 from inference.frames import load_png_sequence
 from inference.protocol import prepare_uvg_input, finish_uvg_reconstruction
-from inference.reconstruction import _estimated_bits, save_reconstruction
+from inference.reconstruction import entropy_bits, save_reconstruction
 from tokenizer.gaussian_tile_decode import GAUSSIAN_VARIANCE
 
 
@@ -34,7 +34,7 @@ def test_frame_io_padding_rate_and_independent_imports(tmp_path):
     features = torch.randn(1, 24, 2, 9, 11)
     indices = torch.randint(0, 4096, (1, 2, 9, 11))
     with torch.inference_mode():
-        bits = _estimated_bits(model, features, indices, k=1)
+        bits = entropy_bits(model, features, indices, k=1)
     torch.testing.assert_close(bits, torch.tensor(indices.numel() * 12.0))
     assert not any(name.split('.')[0] in {'training', 'datasets', 'metrics'}
                    or name.startswith(('src.v1', 'src.legacy', 'src.deprecated'))

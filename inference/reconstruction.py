@@ -1,9 +1,8 @@
 """Single-sequence inference adapted from the original H3VC evaluator."""
 from pathlib import Path
-from typing import Any
 import math
-import time
 import numpy as np
+import lpips
 from PIL import Image
 import torch
 import torch.nn.functional as F
@@ -17,7 +16,7 @@ def selected_code_vectors(
     selected = F.embedding(indices, codebook)
     return selected.permute(0, 4, 1, 2, 3).contiguous()
 
-def _estimated_bits(
+def entropy_bits(
     entropy_model: CategoricalEntropyModel,
     features: torch.Tensor,
     indices: torch.Tensor,
@@ -43,20 +42,14 @@ def _estimated_bits(
     ).reshape(targets.shape) / math.log(2.0)
     return bits[valid_blocks].sum()
 
-def codebook_statistics(counts: torch.Tensor) -> dict[str, Any]:
-    total = int(counts.sum().item())
-    if total == 0:
-        raise ValueError("Cannot measure codebook utilization without assignments")
-    probabilities = counts[counts > 0].double() / total
-    entropy_bits = float(-(probabilities * probabilities.log2()).sum().item())
-    return {
-        "total_assignments": total,
-        "codebook_size": counts.numel(),
-        "active_codes": int((counts > 0).sum().item()),
-        "marginal_entropy_bits": entropy_bits,
-        "perplexity": 2.0 ** entropy_bits,
-        "top1_mass": float(probabilities.max().item()),
-    }
+@torch.inference_mode()
+def sequence_lpips(reference, reconstruction, metric, device):
+    """Mean frame-wise LPIPS-VGG on RGB tensors in [0, 1]."""
+    total = 0.0
+    for ref, rec in zip(reference, reconstruction):
+        total += metric(ref[None].to(device), rec[None].to(device), normalize=True).item()
+    return total / reference.shape[0]
+
 
 def save_reconstruction(reconstruction: torch.Tensor, output_dir: Path) -> None:
     output_dir.mkdir(parents=True)
@@ -73,8 +66,6 @@ def reconstruct(frames_dir, tokenizer, entropy_model, device, recon_root):
     video = load_png_sequence(frames_dir)
     prepared = prepare_uvg_input(video.float().div(255.0))
 
-    torch.cuda.synchronize(device)
-    started = time.perf_counter()
     with torch.autocast("cuda", dtype=torch.bfloat16):
         latent = tokenizer.encode(prepared.model_input.to(device))
         projected = tokenizer.pre_quant(latent)
@@ -90,36 +81,17 @@ def reconstruct(frames_dir, tokenizer, entropy_model, device, recon_root):
     )
     selected = selected_code_vectors(tokenizer.quantizer.embed, indices)
     with torch.autocast("cuda", dtype=torch.bfloat16):
-        bits = float(_estimated_bits(entropy_model, selected, indices, k=1).item())
+        bits = float(entropy_bits(entropy_model, selected, indices, k=1).item())
     with torch.autocast("cuda", dtype=torch.bfloat16):
         reconstruction = tokenizer.decode(
             tokenizer.post_quant(selected.to(projected.dtype))
         )
-    torch.cuda.synchronize(device)
-    total_ms = (time.perf_counter() - started) * 1000.0
-    counts = torch.bincount(flat_indices, minlength=tokenizer.quantizer.embed.shape[0]).cpu()
-
     reconstruction = finish_uvg_reconstruction(reconstruction, prepared)
     if not math.isfinite(bits) or not torch.isfinite(reconstruction).all():
         raise RuntimeError("Non-finite entropy rate or reconstruction")
     save_reconstruction(reconstruction, recon_root)
     reference = prepared.reference
-    difference = reference - reconstruction
-    squared_error = float(difference.square().sum().item())
-    value_count = difference.numel()
-    rate_frames = 96
-    rate_pixels = rate_frames * reference.shape[-2] * reference.shape[-1]
-    return {
-        "codebook": codebook_statistics(counts),
-        "codebook_histogram": counts.tolist(),
-        "sequence": frames_dir.name,
-        "frames": reference.shape[0],
-        "rate_frames": rate_frames,
-        "resolution": [reference.shape[-2], reference.shape[-1]],
-        "psnr": -10.0 * math.log10(squared_error / value_count),
-        "bpp": bits / rate_pixels,
-        "latency_ms": total_ms / reference.shape[0],
-        "bits": bits,
-        "squared_error": squared_error,
-        "value_count": value_count,
-    }
+    rate_pixels = reference.shape[0] * reference.shape[-2] * reference.shape[-1]
+    metric = lpips.LPIPS(net="vgg", version="0.1", verbose=False).to(device).eval()
+    score = sequence_lpips(reference, reconstruction, metric, device)
+    return {"bpp": bits / rate_pixels, "lpips": score}
